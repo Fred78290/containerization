@@ -149,14 +149,14 @@ public struct Image: Codable, Sendable {
     public let config: ImageConfig?
 
     /// rootfs references the layer content addresses used by the image.
-    public let rootfs: Rootfs
+    public let rootfs: Rootfs?
 
     /// history describes the history of each layer.
     public let history: [History]?
 
     public init(
         created: String? = nil, author: String? = nil, architecture: String, os: String, osVersion: String? = nil,
-        osFeatures: [String]? = nil, variant: String? = nil, config: ImageConfig? = nil, rootfs: Rootfs,
+        osFeatures: [String]? = nil, variant: String? = nil, config: ImageConfig? = nil, rootfs: Rootfs? = nil,
         history: [History]? = nil
     ) {
         self.created = created
