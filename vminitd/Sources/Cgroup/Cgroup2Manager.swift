@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// Copyright © 2025 Apple Inc. and the Containerization project authors.
+// Copyright © 2025-2026 Apple Inc. and the Containerization project authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -234,6 +234,38 @@ package struct Cgroup2Manager: Sendable {
         }
     }
 
+    package func setMemoryHigh(bytes: UInt64) throws {
+        self.logger?.debug(
+            "setting memory.high",
+            metadata: [
+                "path": "\(self.path.path)",
+                "bytes": "\(bytes)",
+            ])
+
+        try Self.writeValue(
+            path: self.path,
+            value: String(bytes),
+            fileName: "memory.high"
+        )
+    }
+
+    package func getMemoryEvents() throws -> MemoryEvents {
+        let content = try readFileContent(fileName: "memory.events")
+        let values = parseKeyValuePairs(content)
+
+        return MemoryEvents(
+            low: values["low"] ?? 0,
+            high: values["high"] ?? 0,
+            max: values["max"] ?? 0,
+            oom: values["oom"] ?? 0,
+            oomKill: values["oom_kill"] ?? 0
+        )
+    }
+
+    package func getMemoryEventsPath() -> String {
+        self.path.appending(path: "memory.events").path
+    }
+
     package func kill() throws {
         try Self.writeValue(
             path: self.path,
@@ -253,7 +285,44 @@ package struct Cgroup2Manager: Sendable {
         if force {
             try self.kill()
         }
-        try FileManager.default.removeItem(at: self.path)
+
+        // Recursively remove child cgroups first
+        try removeChildCgroups(at: self.path, force: force)
+
+        let result = rmdir(self.path.path)
+        if result != 0 {
+            throw Error.errno(errno: errno, message: "failed to remove cgroup directory \(self.path.path)")
+        }
+    }
+
+    private func removeChildCgroups(at path: URL, force: Bool) throws {
+        let fileManager = FileManager.default
+
+        guard let contents = try? fileManager.contentsOfDirectory(atPath: path.path) else {
+            return
+        }
+
+        // Remove child directories (potential nested cgroups) first
+        for item in contents {
+            let childPath = path.appending(path: item)
+            var isDirectory: ObjCBool = false
+
+            if fileManager.fileExists(atPath: childPath.path, isDirectory: &isDirectory) && isDirectory.boolValue {
+                if force {
+                    try Self.writeValue(
+                        path: childPath,
+                        value: "1",
+                        fileName: Self.killFile
+                    )
+                }
+
+                try removeChildCgroups(at: childPath, force: force)
+                let result = rmdir(childPath.path)
+                if result != 0 {
+                    throw Error.errno(errno: errno, message: "failed to remove child cgroup \(childPath.path)")
+                }
+            }
+        }
     }
 
     package func stats() throws -> Cgroup2Stats {
@@ -605,6 +674,28 @@ package struct IOEntry: Sendable {
         self.wios = wios
         self.dbytes = dbytes
         self.dios = dios
+    }
+}
+
+package struct MemoryEvents: Sendable {
+    package var low: UInt64
+    package var high: UInt64
+    package var max: UInt64
+    package var oom: UInt64
+    package var oomKill: UInt64
+
+    package init(
+        low: UInt64 = 0,
+        high: UInt64 = 0,
+        max: UInt64 = 0,
+        oom: UInt64 = 0,
+        oomKill: UInt64 = 0
+    ) {
+        self.low = low
+        self.high = high
+        self.max = max
+        self.oom = oom
+        self.oomKill = oomKill
     }
 }
 

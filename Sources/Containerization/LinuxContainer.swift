@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// Copyright © 2025 Apple Inc. and the Containerization project authors.
+// Copyright © 2025-2026 Apple Inc. and the Containerization project authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -62,6 +62,9 @@ public final class LinuxContainer: Container, Sendable {
         public var virtualization: Bool = false
         /// Optional destination for serial boot logs.
         public var bootLog: BootLog?
+        /// EXPERIMENTAL: Path in the root filesystem for the virtual
+        /// machine where the OCI runtime used to spawn the container lives.
+        public var ociRuntimePath: String?
 
         public init() {}
 
@@ -77,7 +80,8 @@ public final class LinuxContainer: Container, Sendable {
             dns: DNS? = nil,
             hosts: Hosts? = nil,
             virtualization: Bool = false,
-            bootLog: BootLog? = nil
+            bootLog: BootLog? = nil,
+            ociRuntimePath: String? = nil
         ) {
             self.process = process
             self.cpus = cpus
@@ -91,6 +95,7 @@ public final class LinuxContainer: Container, Sendable {
             self.hosts = hosts
             self.virtualization = virtualization
             self.bootLog = bootLog
+            self.ociRuntimePath = ociRuntimePath
         }
     }
 
@@ -230,25 +235,22 @@ public final class LinuxContainer: Container, Sendable {
     ///   - vmm: The virtual machine manager that will handle launching the VM for the container.
     ///   - logger: Optional logger for container operations.
     ///   - configuration: A closure that configures the container by modifying the Configuration instance.
-    public init(
+    public convenience init(
         _ id: String,
         rootfs: Mount,
         vmm: VirtualMachineManager,
         logger: Logger? = nil,
         configuration: (inout Configuration) throws -> Void
     ) throws {
-        self.id = id
-        self.vmm = vmm
-        self.hostVsockPorts = Atomic<UInt32>(0x1000_0000)
-        self.guestVsockPorts = Atomic<UInt32>(0x1000_0000)
-        self.rootfs = rootfs
-        self.logger = logger
-
         var config = Configuration()
         try configuration(&config)
-
-        self.config = config
-        self.state = AsyncMutex(.initialized)
+        self.init(
+            id,
+            rootfs: rootfs,
+            vmm: vmm,
+            configuration: config,
+            logger: logger
+        )
     }
 
     /// Create a new `LinuxContainer`.
@@ -270,11 +272,10 @@ public final class LinuxContainer: Container, Sendable {
         self.vmm = vmm
         self.hostVsockPorts = Atomic<UInt32>(0x1000_0000)
         self.guestVsockPorts = Atomic<UInt32>(0x1000_0000)
-        self.rootfs = rootfs
         self.logger = logger
-
         self.config = configuration
         self.state = AsyncMutex(.initialized)
+        self.rootfs = rootfs
     }
 
     private static func createDefaultRuntimeSpec(_ id: String) -> Spec {
@@ -304,6 +305,10 @@ public final class LinuxContainer: Container, Sendable {
         // Linux toggles.
         spec.linux?.sysctl = config.sysctl
 
+        // If the rootfs was requested as read-only, set it in the OCI spec.
+        // We let the OCI runtime remount as ro, instead of doing it originally.
+        spec.root?.readonly = self.rootfs.options.contains("ro")
+
         // Resource limits.
         // CPU: quota/period model where period is 100ms (100,000µs) and quota is cpus * period
         // Memory: limit in bytes
@@ -317,19 +322,42 @@ public final class LinuxContainer: Container, Sendable {
             )
         )
 
+        spec.linux?.namespaces = [
+            LinuxNamespace(type: .cgroup),
+            LinuxNamespace(type: .ipc),
+            LinuxNamespace(type: .mount),
+            LinuxNamespace(type: .pid),
+            LinuxNamespace(type: .uts),
+        ]
+
         return spec
     }
 
+    /// The default set of mounts for a LinuxContainer.
     public static func defaultMounts() -> [Mount] {
         let defaultOptions = ["nosuid", "noexec", "nodev"]
         return [
-            .any(type: "proc", source: "proc", destination: "/proc", options: defaultOptions),
+            .any(type: "proc", source: "proc", destination: "/proc"),
             .any(type: "sysfs", source: "sysfs", destination: "/sys", options: defaultOptions),
             .any(type: "devtmpfs", source: "none", destination: "/dev", options: ["nosuid", "mode=755"]),
             .any(type: "mqueue", source: "mqueue", destination: "/dev/mqueue", options: defaultOptions),
             .any(type: "tmpfs", source: "tmpfs", destination: "/dev/shm", options: defaultOptions + ["mode=1777", "size=65536k"]),
             .any(type: "cgroup2", source: "none", destination: "/sys/fs/cgroup", options: defaultOptions),
-            .any(type: "devpts", source: "devpts", destination: "/dev/pts", options: ["nosuid", "noexec", "gid=5", "mode=620", "ptmxmode=666"]),
+            .any(type: "devpts", source: "devpts", destination: "/dev/pts", options: ["nosuid", "noexec", "newinstance", "gid=5", "mode=0620", "ptmxmode=0666"]),
+        ]
+    }
+
+    /// A more traditional default set of mounts that OCI runtimes typically employ.
+    public static func defaultOCIMounts() -> [Mount] {
+        let defaultOptions = ["nosuid", "noexec", "nodev"]
+        return [
+            .any(type: "proc", source: "proc", destination: "/proc"),
+            .any(type: "tmpfs", source: "tmpfs", destination: "/dev", options: ["nosuid", "mode=755", "size=65536k"]),
+            .any(type: "devpts", source: "devpts", destination: "/dev/pts", options: ["nosuid", "noexec", "newinstance", "gid=5", "mode=0620", "ptmxmode=0666"]),
+            .any(type: "sysfs", source: "sysfs", destination: "/sys", options: defaultOptions),
+            .any(type: "mqueue", source: "mqueue", destination: "/dev/mqueue", options: defaultOptions),
+            .any(type: "tmpfs", source: "tmpfs", destination: "/dev/shm", options: defaultOptions + ["mode=1777", "size=65536k"]),
+            .any(type: "cgroup2", source: "none", destination: "/sys/fs/cgroup", options: defaultOptions),
         ]
     }
 
@@ -366,11 +394,21 @@ extension LinuxContainer {
         try await self.state.withLock { state in
             try state.validateForCreate()
 
+            // This is a bit of an annoyance, but because the type we use for the rootfs is simply
+            // the same Mount type we use for non-rootfs mounts, it's possible someone passed 'ro'
+            // in the options (which should be perfectly valid). However, the problem is when we go to
+            // setup /etc/hosts and /etc/resolv.conf, as we'd get EROFS if they did supply 'ro'.
+            // To remedy this, remove any "ro" options before passing to VZ. Having the OCI runtime
+            // remount "ro" (which is what we do later in the guest) is truthfully the right thing,
+            // but this bit here is just a tad awkward.
+            var modifiedRootfs = self.rootfs
+            modifiedRootfs.options.removeAll(where: { $0 == "ro" })
+
             let vmConfig = VMConfiguration(
                 cpus: self.cpus,
                 memoryInBytes: self.memoryInBytes,
                 interfaces: self.interfaces,
-                mountsByID: [self.id: [self.rootfs] + self.config.mounts],
+                mountsByID: [self.id: [modifiedRootfs] + self.config.mounts],
                 bootLog: self.config.bootLog,
                 nestedVirtualization: self.config.virtualization
             )
@@ -406,10 +444,10 @@ extension LinuxContainer {
                     // 3. If a gateway IP address is present, add the default route.
                     for (index, i) in self.interfaces.enumerated() {
                         let name = "eth\(index)"
-                        try await agent.addressAdd(name: name, address: i.address)
+                        try await agent.addressAdd(name: name, ipv4Address: i.ipv4Address)
                         try await agent.up(name: name, mtu: 1280)
-                        if let gateway = i.gateway {
-                            try await agent.routeAddDefault(name: name, gateway: gateway)
+                        if let ipv4Gateway = i.ipv4Gateway {
+                            try await agent.routeAddDefault(name: name, ipv4Gateway: ipv4Gateway)
                         }
                     }
 
@@ -456,6 +494,7 @@ extension LinuxContainer {
                     containerID: self.id,
                     spec: spec,
                     io: stdio,
+                    ociRuntimePath: self.config.ociRuntimePath,
                     agent: agent,
                     vm: createdState.vm,
                     logger: self.logger
@@ -657,6 +696,7 @@ extension LinuxContainer {
                 containerID: self.id,
                 spec: spec,
                 io: stdio,
+                ociRuntimePath: self.config.ociRuntimePath,
                 agent: agent,
                 vm: startedState.vm,
                 logger: self.logger,
@@ -693,6 +733,7 @@ extension LinuxContainer {
                 containerID: self.id,
                 spec: spec,
                 io: stdio,
+                ociRuntimePath: self.config.ociRuntimePath,
                 agent: agent,
                 vm: state.vm,
                 logger: self.logger,
@@ -798,6 +839,59 @@ extension LinuxContainer {
 
         try await relayManager.start(port: port, socket: socket)
         try await relayAgent.relaySocket(port: port, configuration: socket)
+    }
+
+    /// Default chunk size for file transfers (1MiB).
+    public static let defaultCopyChunkSize = 1024 * 1024
+
+    /// Copy a file from the host into the container.
+    public func copyIn(
+        from source: URL,
+        to destination: URL,
+        mode: UInt32 = 0o644,
+        createParents: Bool = true,
+        chunkSize: Int = defaultCopyChunkSize,
+        progress: ProgressHandler? = nil
+    ) async throws {
+        try await self.state.withLock {
+            let state = try $0.startedState("copyIn")
+
+            let guestPath = URL(filePath: self.root).appending(path: destination.path)
+            try await state.vm.withAgent { agent in
+                try await agent.copyIn(
+                    from: source,
+                    to: guestPath,
+                    mode: mode,
+                    createParents: createParents,
+                    chunkSize: chunkSize,
+                    progress: progress
+                )
+            }
+        }
+    }
+
+    /// Copy a file from the container to the host.
+    public func copyOut(
+        from source: URL,
+        to destination: URL,
+        createParents: Bool = true,
+        chunkSize: Int = defaultCopyChunkSize,
+        progress: ProgressHandler? = nil
+    ) async throws {
+        try await self.state.withLock {
+            let state = try $0.startedState("copyOut")
+
+            let guestPath = URL(filePath: self.root).appending(path: source.path)
+            try await state.vm.withAgent { agent in
+                try await agent.copyOut(
+                    from: guestPath,
+                    to: destination,
+                    createParents: createParents,
+                    chunkSize: chunkSize,
+                    progress: progress
+                )
+            }
+        }
     }
 }
 

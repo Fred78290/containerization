@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// Copyright © 2025 Apple Inc. and the Containerization project authors.
+// Copyright © 2025-2026 Apple Inc. and the Containerization project authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 
 import ArgumentParser
 import ContainerizationOCI
+import ContainerizationOS
 import Foundation
 import LCShim
 import Logging
@@ -34,16 +35,18 @@ struct ExecCommand: ParsableCommand {
     var parentPid: Int
 
     func run() throws {
-        LoggingSystem.bootstrap(App.standardError)
-        let log = Logger(label: "vmexec")
-
-        let src = URL(fileURLWithPath: processPath)
-        let processBytes = try Data(contentsOf: src)
-        let process = try JSONDecoder().decode(
-            ContainerizationOCI.Process.self,
-            from: processBytes
-        )
-        try execInNamespaces(process: process, log: log)
+        do {
+            let src = URL(fileURLWithPath: processPath)
+            let processBytes = try Data(contentsOf: src)
+            let process = try JSONDecoder().decode(
+                ContainerizationOCI.Process.self,
+                from: processBytes
+            )
+            try execInNamespaces(process: process)
+        } catch {
+            App.writeError(error)
+            throw error
+        }
     }
 
     static func enterNS(pidFd: Int32, nsType: Int32) throws {
@@ -52,10 +55,7 @@ struct ExecCommand: ParsableCommand {
         }
     }
 
-    private func execInNamespaces(
-        process: ContainerizationOCI.Process,
-        log: Logger
-    ) throws {
+    private func execInNamespaces(process: ContainerizationOCI.Process) throws {
         let syncPipe = FileHandle(fileDescriptor: 3)
         let ackPipe = FileHandle(fileDescriptor: 4)
 
@@ -128,11 +128,17 @@ struct ExecCommand: ParsableCommand {
             try App.applyCloseExecOnFDs()
             try App.setRLimits(rlimits: process.rlimits)
 
+            // Prepare capabilities (before user change)
+            let preparedCaps = try App.prepareCapabilities(capabilities: process.capabilities ?? ContainerizationOCI.LinuxCapabilities())
+
             // Change stdio to be owned by the requested user.
             try App.fixStdioPerms(user: process.user)
 
             // Set uid, gid, and supplementary groups
             try App.setPermissions(user: process.user)
+
+            // Finish capabilities (after user change)
+            try App.finishCapabilities(preparedCaps)
 
             try App.exec(process: process)
         } else {  // parent process

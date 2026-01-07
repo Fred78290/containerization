@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// Copyright © 2025 Apple Inc. and the Containerization project authors.
+// Copyright © 2025-2026 Apple Inc. and the Containerization project authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 
 import ContainerizationError
+import ContainerizationExtras
 import ContainerizationOCI
 import Foundation
 
@@ -45,6 +46,27 @@ public protocol VirtualMachineAgent: Sendable {
     func sync() async throws
     func writeFile(path: String, data: Data, flags: WriteFileFlags, mode: UInt32) async throws
 
+    // File transfer
+
+    /// Copy a file from the host into the guest.
+    func copyIn(
+        from source: URL,
+        to destination: URL,
+        mode: UInt32,
+        createParents: Bool,
+        chunkSize: Int,
+        progress: ProgressHandler?
+    ) async throws
+
+    /// Copy a file from the guest to the host.
+    func copyOut(
+        from source: URL,
+        to destination: URL,
+        createParents: Bool,
+        chunkSize: Int,
+        progress: ProgressHandler?
+    ) async throws
+
     // Process lifecycle
     func createProcess(
         id: String,
@@ -52,6 +74,7 @@ public protocol VirtualMachineAgent: Sendable {
         stdinPort: UInt32?,
         stdoutPort: UInt32?,
         stderrPort: UInt32?,
+        ociRuntimePath: String?,
         configuration: ContainerizationOCI.Spec,
         options: Data?
     ) async throws
@@ -65,8 +88,8 @@ public protocol VirtualMachineAgent: Sendable {
     // Networking
     func up(name: String, mtu: UInt32?) async throws
     func down(name: String) async throws
-    func addressAdd(name: String, address: String) async throws
-    func routeAddDefault(name: String, gateway: String) async throws
+    func addressAdd(name: String, ipv4Address: CIDRv4) async throws
+    func routeAddDefault(name: String, ipv4Gateway: IPv4Address) async throws
     func configureDNS(config: DNS, location: String) async throws
     func configureHosts(config: Hosts, location: String) async throws
 
@@ -93,5 +116,26 @@ extension VirtualMachineAgent {
 
     public func sync() async throws {
         throw ContainerizationError(.unsupported, message: "sync")
+    }
+
+    public func copyIn(
+        from source: URL,
+        to destination: URL,
+        mode: UInt32,
+        createParents: Bool,
+        chunkSize: Int,
+        progress: ProgressHandler?
+    ) async throws {
+        throw ContainerizationError(.unsupported, message: "copyIn")
+    }
+
+    public func copyOut(
+        from source: URL,
+        to destination: URL,
+        createParents: Bool,
+        chunkSize: Int,
+        progress: ProgressHandler?
+    ) async throws {
+        throw ContainerizationError(.unsupported, message: "copyOut")
     }
 }

@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// Copyright © 2025 Apple Inc. and the Containerization project authors.
+// Copyright © 2025-2026 Apple Inc. and the Containerization project authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 import ArgumentParser
 import Cgroup
 import ContainerizationOCI
+import ContainerizationOS
 import Foundation
 import LCShim
 import Logging
@@ -32,29 +33,60 @@ struct RunCommand: ParsableCommand {
     var bundlePath: String
 
     mutating func run() throws {
-        LoggingSystem.bootstrap(App.standardError)
-        let log = Logger(label: "vmexec")
-
-        let bundle = try ContainerizationOCI.Bundle.load(path: URL(filePath: bundlePath))
-        let ociSpec = try bundle.loadConfig()
-        try execInNamespace(spec: ociSpec, log: log)
+        do {
+            let spec: ContainerizationOCI.Spec
+            do {
+                let bundle = try ContainerizationOCI.Bundle.load(path: URL(filePath: bundlePath))
+                spec = try bundle.loadConfig()
+            } catch {
+                throw App.Failure(message: "failed to load OCI bundle at \(bundlePath): \(error)")
+            }
+            try execInNamespace(spec: spec)
+        } catch {
+            App.writeError(error)
+            throw error
+        }
     }
 
-    private func childRootSetup(rootfs: ContainerizationOCI.Root, mounts: [ContainerizationOCI.Mount], log: Logger) throws {
+    private func childRootSetup(rootfs: ContainerizationOCI.Root, mounts: [ContainerizationOCI.Mount]) throws {
         // setup rootfs
         try prepareRoot(rootfs: rootfs.path)
         try mountRootfs(rootfs: rootfs.path, mounts: mounts)
         try setDevSymlinks(rootfs: rootfs.path)
 
         try pivotRoot(rootfs: rootfs.path)
+
+        // Remount ro if requested.
+        if rootfs.readonly {
+            try self.remountRootfsReadOnly()
+        }
+
         try reOpenDevNull()
+    }
+
+    private func remountRootfsReadOnly() throws {
+        var flags = UInt(MS_BIND | MS_REMOUNT | MS_RDONLY)
+
+        let ret = mount("", "/", "", flags, "")
+        if ret == 0 {
+            return
+        }
+
+        var s = statfs()
+        guard statfs("/", &s) == 0 else {
+            throw App.Errno(stage: "statfs(/)")
+        }
+        flags |= s.f_flags
+
+        guard mount("", "/", "", flags, "") == 0 else {
+            throw App.Errno(stage: "mount rootfs ro")
+        }
     }
 
     private func childSetup(
         spec: ContainerizationOCI.Spec,
         ackPipe: FileHandle,
         syncPipe: FileHandle,
-        log: Logger
     ) throws {
         guard let process = spec.process else {
             throw App.Failure(message: "no process configuration found in runtime spec")
@@ -83,7 +115,7 @@ struct RunCommand: ParsableCommand {
             throw App.Errno(stage: "setsid()")
         }
 
-        try childRootSetup(rootfs: root, mounts: spec.mounts, log: log)
+        try childRootSetup(rootfs: root, mounts: spec.mounts)
 
         if process.terminal {
             let pty = try Console()
@@ -131,22 +163,70 @@ struct RunCommand: ParsableCommand {
 
         try App.setRLimits(rlimits: process.rlimits)
 
+        // Prepare capabilities (before user change)
+        let preparedCaps = try App.prepareCapabilities(capabilities: process.capabilities ?? ContainerizationOCI.LinuxCapabilities())
+
         // Change stdio to be owned by the requested user.
         try App.fixStdioPerms(user: process.user)
 
         // Set uid, gid, and supplementary groups.
         try App.setPermissions(user: process.user)
 
+        // Finish capabilities (after user change)
+        try App.finishCapabilities(preparedCaps)
+
         // Finally execve the container process.
         try App.exec(process: process, currentEnv: process.env)
     }
 
-    private func execInNamespace(spec: ContainerizationOCI.Spec, log: Logger) throws {
+    private func setupNamespaces(namespaces: [ContainerizationOCI.LinuxNamespace]?) throws -> Int32 {
+        var unshareFlags: Int32 = 0
+
+        // Map namespace types to their corresponding CLONE flags
+        let nsTypeToFlag: [ContainerizationOCI.LinuxNamespaceType: Int32] = [
+            .pid: CLONE_NEWPID,
+            .mount: CLONE_NEWNS,
+            .uts: CLONE_NEWUTS,
+            .ipc: CLONE_NEWIPC,
+            .user: CLONE_NEWUSER,
+            .cgroup: CLONE_NEWCGROUP,
+        ]
+
+        guard let namespaces = namespaces else {
+            return CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS
+        }
+
+        for ns in namespaces {
+            guard let flag = nsTypeToFlag[ns.type] else {
+                continue
+            }
+
+            if ns.path.isEmpty {
+                unshareFlags |= flag
+            } else {
+                let fd = open(ns.path, O_RDONLY | O_CLOEXEC)
+                guard fd >= 0 else {
+                    throw App.Errno(stage: "open(\(ns.path))")
+                }
+                defer { close(fd) }
+
+                guard setns(fd, flag) == 0 else {
+                    throw App.Errno(stage: "setns(\(ns.path))")
+                }
+            }
+        }
+
+        return unshareFlags
+    }
+
+    private func execInNamespace(spec: ContainerizationOCI.Spec) throws {
         let syncPipe = FileHandle(fileDescriptor: 3)
         let ackPipe = FileHandle(fileDescriptor: 4)
 
-        guard unshare(CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS) == 0 else {
-            throw App.Errno(stage: "unshare(pid|mnt|uts)")
+        let unshareFlags = try setupNamespaces(namespaces: spec.linux?.namespaces)
+
+        guard unshare(unshareFlags) == 0 else {
+            throw App.Errno(stage: "unshare(\(unshareFlags))")
         }
 
         let processID = fork()
@@ -157,7 +237,7 @@ struct RunCommand: ParsableCommand {
         }
 
         if processID == 0 {  // child
-            try childSetup(spec: spec, ackPipe: ackPipe, syncPipe: syncPipe, log: log)
+            try childSetup(spec: spec, ackPipe: ackPipe, syncPipe: syncPipe)
         } else {  // parent process
             // Setup cgroup before child enters cgroup namespace
             if let linux = spec.linux {

@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// Copyright © 2025 Apple Inc. and the Containerization project authors.
+// Copyright © 2025-2026 Apple Inc. and the Containerization project authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 
 import ContainerizationError
+import ContainerizationExtras
 import ContainerizationOCI
 import ContainerizationOS
 import Foundation
@@ -54,24 +55,14 @@ extension Vminitd: VirtualMachineAgent {
 
         try await setenv(key: "PATH", value: LinuxProcessConfiguration.defaultPath)
 
+        // Vminitd mounts /proc, /sys, /sys/fs/cgroup and /run automatically.
         let mounts: [ContainerizationOCI.Mount] = [
-            .init(type: "sysfs", source: "sysfs", destination: "/sys"),
             .init(type: "tmpfs", source: "tmpfs", destination: "/tmp"),
             .init(type: "devpts", source: "devpts", destination: "/dev/pts", options: ["gid=5", "mode=620", "ptmxmode=666"]),
-            .init(type: "cgroup2", source: "none", destination: "/sys/fs/cgroup"),
         ]
         for mount in mounts {
             try await self.mount(mount)
         }
-
-        // Setup root cg subtree_control.
-        let data = "+memory +pids +io +cpu +cpuset +hugetlb".data(using: .utf8)!
-        try await writeFile(
-            path: "/sys/fs/cgroup/cgroup.subtree_control",
-            data: data,
-            flags: .init(),
-            mode: 0
-        )
     }
 
     public func writeFile(path: String, data: Data, flags: WriteFileFlags, mode: UInt32) async throws {
@@ -185,6 +176,7 @@ extension Vminitd: VirtualMachineAgent {
         stdinPort: UInt32?,
         stdoutPort: UInt32?,
         stderrPort: UInt32?,
+        ociRuntimePath: String?,
         configuration: ContainerizationOCI.Spec,
         options: Data?
     ) async throws {
@@ -203,6 +195,9 @@ extension Vminitd: VirtualMachineAgent {
                 }
                 if let containerID {
                     $0.containerID = containerID
+                }
+                if let ociRuntimePath {
+                    $0.ociRuntimePath = ociRuntimePath
                 }
                 $0.configuration = try enc.encode(configuration)
             })
@@ -365,20 +360,20 @@ extension Vminitd {
     }
 
     /// Add an IP address to the sandbox's network interfaces.
-    public func addressAdd(name: String, address: String) async throws {
+    public func addressAdd(name: String, ipv4Address: CIDRv4) async throws {
         _ = try await client.ipAddrAdd(
             .with {
                 $0.interface = name
-                $0.address = address
+                $0.ipv4Address = ipv4Address.description
             })
     }
 
     /// Set the default route in the sandbox's environment.
-    public func routeAddDefault(name: String, gateway: String) async throws {
+    public func routeAddDefault(name: String, ipv4Gateway: IPv4Address) async throws {
         _ = try await client.ipRouteAddDefault(
             .with {
                 $0.interface = name
-                $0.gateway = gateway
+                $0.ipv4Gateway = ipv4Gateway.description
             })
     }
 
@@ -414,6 +409,96 @@ extension Vminitd {
             })
         return response.result
     }
+
+    /// Copy a file from the host into the guest.
+    public func copyIn(
+        from source: URL,
+        to destination: URL,
+        mode: UInt32,
+        createParents: Bool,
+        chunkSize: Int,
+        progress: ProgressHandler?
+    ) async throws {
+        let fileHandle = try FileHandle(forReadingFrom: source)
+        defer { try? fileHandle.close() }
+
+        let attrs = try FileManager.default.attributesOfItem(atPath: source.path)
+        guard let fileSize = attrs[.size] as? Int64 else {
+            throw ContainerizationError(
+                .invalidArgument,
+                message: "copyIn: failed to get file size for '\(source.path)'"
+            )
+        }
+
+        await progress?([ProgressEvent(event: "add-total-size", value: fileSize)])
+
+        let call = client.makeCopyInCall()
+
+        try await call.requestStream.send(
+            .with {
+                $0.content = .init_p(
+                    .with {
+                        $0.path = destination.path
+                        $0.mode = mode
+                        $0.createParents = createParents
+                    })
+            }
+        )
+
+        var totalSent: Int64 = 0
+        while true {
+            guard let data = try fileHandle.read(upToCount: chunkSize), !data.isEmpty else {
+                break
+            }
+            try await call.requestStream.send(.with { $0.content = .data(data) })
+            totalSent += Int64(data.count)
+            await progress?([ProgressEvent(event: "add-size", value: Int64(data.count))])
+        }
+
+        call.requestStream.finish()
+        _ = try await call.response
+    }
+
+    /// Copy a file from the guest to the host.
+    public func copyOut(
+        from source: URL,
+        to destination: URL,
+        createParents: Bool,
+        chunkSize: Int,
+        progress: ProgressHandler?
+    ) async throws {
+        let request = Com_Apple_Containerization_Sandbox_V3_CopyOutRequest.with {
+            $0.path = source.path
+        }
+
+        if createParents {
+            let parentDir = destination.deletingLastPathComponent()
+            try FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true)
+        }
+
+        let fd = open(destination.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        guard fd != -1 else {
+            throw ContainerizationError(
+                .internalError,
+                message: "copyOut: failed to open '\(destination.path)': \(String(cString: strerror(errno)))"
+            )
+        }
+        let fileHandle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        defer { try? fileHandle.close() }
+
+        let stream = client.copyOut(request)
+        for try await chunk in stream {
+            switch chunk.content {
+            case .init_p(let initMsg):
+                await progress?([ProgressEvent(event: "add-total-size", value: Int64(initMsg.totalSize))])
+            case .data(let data):
+                try fileHandle.write(contentsOf: data)
+                await progress?([ProgressEvent(event: "add-size", value: Int64(data.count))])
+            case .none:
+                break
+            }
+        }
+    }
 }
 
 extension Hosts {
@@ -438,25 +523,13 @@ extension Hosts {
 }
 
 extension Vminitd.Client {
-    public init(socket: String, group: EventLoopGroup) {
-        var config = ClientConnection.Configuration.default(
-            target: .unixDomainSocket(socket),
-            eventLoopGroup: group
-        )
-        config.maximumReceiveMessageLength = Int(64.mib())
-        config.connectionBackoff = ConnectionBackoff(retries: .upTo(5))
-
-        self = .init(channel: ClientConnection(configuration: config))
-    }
-
     public init(connection: FileHandle, group: EventLoopGroup) {
         var config = ClientConnection.Configuration.default(
             target: .connectedSocket(connection.fileDescriptor),
             eventLoopGroup: group
         )
+        config.connectionBackoff = nil
         config.maximumReceiveMessageLength = Int(64.mib())
-        config.connectionBackoff = ConnectionBackoff(retries: .upTo(5))
-
         self = .init(channel: ClientConnection(configuration: config))
     }
 

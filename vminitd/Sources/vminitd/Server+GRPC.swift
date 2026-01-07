@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-// Copyright © 2025 Apple Inc. and the Containerization project authors.
+// Copyright © 2025-2026 Apple Inc. and the Containerization project authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 import Cgroup
 import Containerization
 import ContainerizationError
+import ContainerizationExtras
 import ContainerizationNetlink
 import ContainerizationOCI
 import ContainerizationOS
@@ -26,7 +27,6 @@ import Logging
 import NIOCore
 import NIOPosix
 import SwiftProtobuf
-import _NIOFileSystem
 
 private let _setenv = Foundation.setenv
 
@@ -306,6 +306,154 @@ extension Initd: Com_Apple_Containerization_Sandbox_V3_SandboxContextAsyncProvid
         return .init()
     }
 
+    // Chunk size for streaming file transfers (1MB).
+    private static let copyChunkSize = 1024 * 1024
+
+    func copyIn(
+        requestStream: GRPCAsyncRequestStream<Com_Apple_Containerization_Sandbox_V3_CopyInChunk>,
+        context: GRPC.GRPCAsyncServerCallContext
+    ) async throws -> Com_Apple_Containerization_Sandbox_V3_CopyInResponse {
+        var fileHandle: FileHandle?
+        var path: String = ""
+        var totalBytes: Int = 0
+
+        do {
+            for try await chunk in requestStream {
+                switch chunk.content {
+                case .init_p(let initMsg):
+                    path = initMsg.path
+                    log.debug(
+                        "copyIn",
+                        metadata: [
+                            "path": "\(path)",
+                            "mode": "\(initMsg.mode)",
+                            "createParents": "\(initMsg.createParents)",
+                        ])
+
+                    if initMsg.createParents {
+                        let fileURL = URL(fileURLWithPath: path)
+                        let parentDir = fileURL.deletingLastPathComponent()
+                        try FileManager.default.createDirectory(
+                            at: parentDir,
+                            withIntermediateDirectories: true
+                        )
+                    }
+
+                    let mode = initMsg.mode > 0 ? mode_t(initMsg.mode) : mode_t(0o644)
+                    let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode)
+                    guard fd != -1 else {
+                        throw GRPCStatus(
+                            code: .internalError,
+                            message: "copyIn: failed to open file '\(path)': \(swiftErrno("open"))"
+                        )
+                    }
+                    fileHandle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+                case .data(let bytes):
+                    guard let fh = fileHandle else {
+                        throw GRPCStatus(
+                            code: .failedPrecondition,
+                            message: "copyIn: received data before init message"
+                        )
+                    }
+                    if !bytes.isEmpty {
+                        try fh.write(contentsOf: bytes)
+                        totalBytes += bytes.count
+                    }
+                case .none:
+                    break
+                }
+            }
+
+            log.debug(
+                "copyIn complete",
+                metadata: [
+                    "path": "\(path)",
+                    "totalBytes": "\(totalBytes)",
+                ])
+
+            return .init()
+        } catch {
+            log.error(
+                "copyIn",
+                metadata: [
+                    "path": "\(path)",
+                    "error": "\(error)",
+                ])
+            if error is GRPCStatus {
+                throw error
+            }
+            throw GRPCStatus(
+                code: .internalError,
+                message: "copyIn: \(error)"
+            )
+        }
+    }
+
+    func copyOut(
+        request: Com_Apple_Containerization_Sandbox_V3_CopyOutRequest,
+        responseStream: GRPCAsyncResponseStreamWriter<Com_Apple_Containerization_Sandbox_V3_CopyOutChunk>,
+        context: GRPC.GRPCAsyncServerCallContext
+    ) async throws {
+        let path = request.path
+        log.debug(
+            "copyOut",
+            metadata: [
+                "path": "\(path)"
+            ])
+
+        do {
+            let fileURL = URL(fileURLWithPath: path)
+            let attrs = try FileManager.default.attributesOfItem(atPath: path)
+            guard let fileSize = attrs[.size] as? UInt64 else {
+                throw GRPCStatus(
+                    code: .internalError,
+                    message: "copyOut: failed to get file size for '\(path)'"
+                )
+            }
+
+            let fileHandle = try FileHandle(forReadingFrom: fileURL)
+            defer { try? fileHandle.close() }
+
+            // Send init message with total size.
+            try await responseStream.send(
+                .with {
+                    $0.content = .init_p(.with { $0.totalSize = fileSize })
+                }
+            )
+
+            var totalSent: UInt64 = 0
+            while true {
+                guard let data = try fileHandle.read(upToCount: Self.copyChunkSize), !data.isEmpty else {
+                    break
+                }
+
+                try await responseStream.send(.with { $0.content = .data(data) })
+                totalSent += UInt64(data.count)
+            }
+
+            log.debug(
+                "copyOut complete",
+                metadata: [
+                    "path": "\(path)",
+                    "totalBytes": "\(totalSent)",
+                ])
+        } catch {
+            log.error(
+                "copyOut",
+                metadata: [
+                    "path": "\(path)",
+                    "error": "\(error)",
+                ])
+            if error is GRPCStatus {
+                throw error
+            }
+            throw GRPCStatus(
+                code: .internalError,
+                message: "copyOut: \(error)"
+            )
+        }
+    }
+
     func mount(request: Com_Apple_Containerization_Sandbox_V3_MountRequest, context: GRPC.GRPCAsyncServerCallContext)
         async throws -> Com_Apple_Containerization_Sandbox_V3_MountResponse
     {
@@ -429,7 +577,6 @@ extension Initd: Com_Apple_Containerization_Sandbox_V3_SandboxContextAsyncProvid
                 "stdin": "Port: \(request.stdin)",
                 "stdout": "Port: \(request.stdout)",
                 "stderr": "Port: \(request.stderr)",
-                "configuration": "\(request.configuration.count)",
             ])
 
         if !request.hasContainerID {
@@ -488,10 +635,11 @@ extension Initd: Com_Apple_Containerization_Sandbox_V3_SandboxContextAsyncProvid
                     try hostname.write(toFile: hostnamePath.path, atomically: true, encoding: .utf8)
                 }
 
-                let ctr = try ManagedContainer(
+                let ctr = try await ManagedContainer(
                     id: request.id,
                     stdio: stdioPorts,
                     spec: ociSpec,
+                    ociRuntimePath: request.hasOciRuntimePath ? request.ociRuntimePath : nil,
                     log: self.log
                 )
                 try await self.state.add(container: ctr)
@@ -685,7 +833,7 @@ extension Initd: Com_Apple_Containerization_Sandbox_V3_SandboxContextAsyncProvid
             let exitStatus = try await ctr.wait(execID: request.id)
 
             return .with {
-                $0.exitCode = exitStatus.exitStatus
+                $0.exitCode = exitStatus.exitCode
                 $0.exitedAt = Google_Protobuf_Timestamp(date: exitStatus.exitedAt)
             }
         } catch {
@@ -775,13 +923,14 @@ extension Initd: Com_Apple_Containerization_Sandbox_V3_SandboxContextAsyncProvid
             "ipAddrAdd",
             metadata: [
                 "interface": "\(request.interface)",
-                "address": "\(request.address)",
+                "ipv4Address": "\(request.ipv4Address)",
             ])
 
         do {
             let socket = try DefaultNetlinkSocket()
             let session = NetlinkSession(socket: socket, log: log)
-            try session.addressAdd(interface: request.interface, address: request.address)
+            let ipv4Address = try CIDRv4(request.ipv4Address)
+            try session.addressAdd(interface: request.interface, ipv4Address: ipv4Address)
         } catch {
             log.error(
                 "ipAddrAdd",
@@ -801,17 +950,19 @@ extension Initd: Com_Apple_Containerization_Sandbox_V3_SandboxContextAsyncProvid
             "ipRouteAddLink",
             metadata: [
                 "interface": "\(request.interface)",
-                "address": "\(request.address)",
-                "srcAddr": "\(request.srcAddr)",
+                "dstIpv4Addr": "\(request.dstIpv4Addr)",
+                "srcIpv4Addr": "\(request.srcIpv4Addr)",
             ])
 
         do {
             let socket = try DefaultNetlinkSocket()
             let session = NetlinkSession(socket: socket, log: log)
+            let dstIpv4Addr = try CIDRv4(request.dstIpv4Addr)
+            let srcIpv4Addr = try IPv4Address(request.srcIpv4Addr)
             try session.routeAdd(
                 interface: request.interface,
-                destinationAddress: request.address,
-                srcAddr: request.srcAddr
+                dstIpv4Addr: dstIpv4Addr,
+                srcIpv4Addr: srcIpv4Addr
             )
         } catch {
             log.error(
@@ -833,13 +984,14 @@ extension Initd: Com_Apple_Containerization_Sandbox_V3_SandboxContextAsyncProvid
             "ipRouteAddDefault",
             metadata: [
                 "interface": "\(request.interface)",
-                "gateway": "\(request.gateway)",
+                "ipv4Gateway": "\(request.ipv4Gateway)",
             ])
 
         do {
             let socket = try DefaultNetlinkSocket()
             let session = NetlinkSession(socket: socket, log: log)
-            try session.routeAddDefault(interface: request.interface, gateway: request.gateway)
+            let ipv4Gateway = try IPv4Address(request.ipv4Gateway)
+            try session.routeAddDefault(interface: request.interface, ipv4Gateway: ipv4Gateway)
         } catch {
             log.error(
                 "ipRouteAddDefault",
