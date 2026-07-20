@@ -28,23 +28,21 @@ public struct AttachedFilesystem: Sendable {
     /// The options to use when mounting the filesystem.
     public var options: [String]
 
-    #if os(macOS)
     public init(mount: Mount, allocator: any AddressAllocator<Character>) throws {
-        switch mount.type {
-        case "virtiofs":
-            let name = try hashMountSource(source: mount.source)
+        switch mount.runtimeOptions {
+        case .virtiofs:
+            let name = try hashFilePath(path: mount.source)
             self.source = name
-        case "ext4":
+        case .virtioblk:
             let char = try allocator.allocate()
             self.source = "/dev/vd\(char)"
-        default:
+        case .shared, .any:
             self.source = mount.source
         }
         self.type = mount.type
         self.options = mount.options
         self.destination = mount.destination
     }
-    #endif
 
     public init(type: String, source: String, destination: String, options: [String]) {
         self.type = type

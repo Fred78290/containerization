@@ -14,7 +14,6 @@
 // limitations under the License.
 //===----------------------------------------------------------------------===//
 
-#if os(macOS)
 import ContainerizationError
 import ContainerizationExtras
 import ContainerizationOCI
@@ -30,6 +29,8 @@ import struct ContainerizationOS.Terminal
 /// virtual machine. Each container has its own rootfs and process, but
 /// shares the VM's resources (CPU, memory, network).
 public final class LinuxPod: Sendable {
+    static let maxIDLength = 64
+
     /// The identifier of the pod.
     public let id: String
 
@@ -44,8 +45,6 @@ public final class LinuxPod: Sendable {
         public var memoryInBytes: UInt64 = 1024.mib()
         /// The network interfaces for the pod.
         public var interfaces: [any Interface] = []
-        /// The DNS configuration for the pod.
-        public var dns: DNS?
         /// Whether nested virtualization should be turned on for the pod.
         public var virtualization: Bool = false
         /// Optional file path to store serial boot logs.
@@ -53,6 +52,19 @@ public final class LinuxPod: Sendable {
         /// Whether containers in the pod should share a PID namespace.
         /// When enabled, all containers can see each other's processes.
         public var shareProcessNamespace: Bool = false
+        /// The default hostname for all containers in the pod.
+        /// Individual containers can override this by setting their own `hostname` configuration.
+        public var hostname: String?
+        /// The default DNS configuration for all containers in the pod.
+        /// Individual containers can override this by setting their own `dns` configuration.
+        public var dns: DNS?
+        /// The default hosts file configuration for all containers in the pod.
+        /// Individual containers can override this by setting their own `hosts` configuration.
+        public var hosts: Hosts?
+        /// Volumes attached to the pod. Can be shared with multiple containers.
+        public var volumes: [PodVolume] = []
+        /// Extension objects that participate in the VM instance lifecycle.
+        public var extensions: [any Sendable] = []
 
         public init() {}
     }
@@ -66,15 +78,81 @@ public final class LinuxPod: Sendable {
         /// Optional per-container memory limit in bytes (can exceed pod total for oversubscription).
         public var memoryInBytes: UInt64?
         /// The hostname for the container.
-        public var hostname: String = ""
+        public var hostname: String?
         /// The system control options for the container.
         public var sysctl: [String: String] = [:]
         /// The mounts for the container.
         public var mounts: [Mount] = LinuxContainer.defaultMounts()
+        /// Paths inside the container that vmexec hides from the workload.
+        /// Defaults to the OCI standard set (``LinuxContainer/defaultMaskedPaths()``),
+        /// matching the restricted capability baseline. Set to `[]` to opt out,
+        /// or append to extend it.
+        public var maskedPaths: [String] = LinuxContainer.defaultMaskedPaths()
+        /// Paths inside the container that vmexec marks read-only.
+        /// Defaults to the OCI standard set (``LinuxContainer/defaultReadonlyPaths()``),
+        /// matching the restricted capability baseline. Set to `[]` to opt out,
+        /// or append to extend it.
+        public var readonlyPaths: [String] = LinuxContainer.defaultReadonlyPaths()
         /// The Unix domain socket relays to setup for the container.
         public var sockets: [UnixSocketConfiguration] = []
+        /// The DNS configuration for the container.
+        public var dns: DNS?
+        /// The hosts file configuration for the container.
+        public var hosts: Hosts?
+        /// Run the container with a minimal init process that handles signal
+        /// forwarding and zombie reaping.
+        public var useInit: Bool = false
 
         public init() {}
+    }
+
+    /// A volume that is attached at the pod level and can be shared by multiple containers.
+    public struct PodVolume: Sendable {
+        /// Describes the backing storage for the volume.
+        public enum Source: Sendable {
+            /// A network block device (NBD) volume.
+            case nbd(url: URL, timeout: TimeInterval? = nil, readOnly: Bool = false)
+            /// A disk-image file on the host, attached as a virtio-block device.
+            case diskImage(path: URL, readOnly: Bool = false)
+        }
+
+        /// The logical name of this volume. Containers reference this name
+        /// via `Mount.sharedMount(name:destination:)` in their mounts.
+        public var name: String
+        /// The backing storage source for this volume.
+        public var source: Source
+        /// The filesystem format on the volume.
+        public var format: String
+
+        public init(name: String, source: Source, format: String) {
+            self.name = name
+            self.source = source
+            self.format = format
+        }
+
+        func toMount() -> Mount {
+            switch source {
+            case .nbd(let url, let timeout, let readOnly):
+                var runtimeOptions: [String] = []
+                if let timeout {
+                    runtimeOptions.append("vzTimeout=\(timeout)")
+                }
+                return Mount.block(
+                    format: self.format,
+                    source: url.absoluteString,
+                    destination: LinuxPod.guestVolumePath(name),
+                    options: readOnly ? ["ro"] : [],
+                    runtimeOptions: runtimeOptions
+                )
+            case .diskImage(let path, let readOnly):
+                return Mount.block(
+                    format: self.format,
+                    source: path.absolutePath(),
+                    destination: LinuxPod.guestVolumePath(name),
+                    options: readOnly ? ["ro"] : []
+                )
+            }
+        }
     }
 
     private struct PodContainer: Sendable {
@@ -83,6 +161,7 @@ public final class LinuxPod: Sendable {
         let config: ContainerConfiguration
         var state: ContainerState
         var process: LinuxProcess?
+        var fileMountContext: FileMountContext
 
         enum ContainerState: Sendable {
             case registered
@@ -167,6 +246,12 @@ public final class LinuxPod: Sendable {
         logger: Logger? = nil,
         configuration: (inout Configuration) throws -> Void
     ) throws {
+        guard id.count <= Self.maxIDLength else {
+            throw ContainerizationError(
+                .invalidArgument,
+                message: "pod id length \(id.count) exceeds maximum of \(Self.maxIDLength) characters"
+            )
+        }
         self.id = id
         self.vmm = vmm
         self.hostVsockPorts = Atomic<UInt32>(0x1000_0000)
@@ -201,11 +286,22 @@ public final class LinuxPod: Sendable {
         // Process configuration
         spec.process = config.process.toOCI()
 
+        // Wrap with init process if requested.
+        if config.useInit {
+            let originalArgs = spec.process?.args ?? []
+            spec.process?.args = ["/.cz-init", "--"] + originalArgs
+        }
+
         // General toggles
-        spec.hostname = config.hostname
+        // Container-level hostname takes precedence; fall back to pod-level hostname.
+        if let hostname = config.hostname ?? self.config.hostname {
+            spec.hostname = hostname
+        }
 
         // Linux toggles
         spec.linux?.sysctl = config.sysctl
+        spec.linux?.maskedPaths = config.maskedPaths
+        spec.linux?.readonlyPaths = config.readonlyPaths
 
         // If the rootfs was requested as read-only, set it in the OCI spec.
         // We let the OCI runtime remount as ro, instead of doing it originally.
@@ -227,8 +323,16 @@ public final class LinuxPod: Sendable {
         return spec
     }
 
-    private static func guestRootfsPath(_ containerID: String) -> String {
+    static func guestRootfsPath(_ containerID: String) -> String {
         "/run/container/\(containerID)/rootfs"
+    }
+
+    static func guestSocketStagingPath(_ socketID: String) -> String {
+        "/run/sockets/\(socketID).sock"
+    }
+
+    private static func guestVolumePath(_ volumeName: String) -> String {
+        "/run/volumes/\(volumeName)"
     }
 }
 
@@ -248,21 +352,23 @@ extension LinuxPod {
         config.interfaces
     }
 
-    /// Add a container to the pod. This must be called before `create()`.
-    /// The container will be registered but not started.
+    /// Add a container to the pod.
+    ///
+    /// When called before `create()`, the container is registered for setup during VM creation.
+    /// When called after `create()`, the container is hotplugged into the running VM.
+    /// If the underlying VMM does not support hotplug, an error is thrown.
     public func addContainer(
         _ id: String,
         rootfs: Mount,
         configuration: @Sendable @escaping (inout ContainerConfiguration) throws -> Void
     ) async throws {
+        guard id.count <= Self.maxIDLength else {
+            throw ContainerizationError(
+                .invalidArgument,
+                message: "container id length \(id.count) exceeds maximum of \(Self.maxIDLength) characters"
+            )
+        }
         try await self.state.withLock { state in
-            guard case .initialized = state.phase else {
-                throw ContainerizationError(
-                    .invalidState,
-                    message: "pod must be initialized to add container"
-                )
-            }
-
             guard state.containers[id] == nil else {
                 throw ContainerizationError(
                     .invalidArgument,
@@ -273,13 +379,150 @@ extension LinuxPod {
             var config = ContainerConfiguration()
             try configuration(&config)
 
-            state.containers[id] = PodContainer(
-                id: id,
-                rootfs: rootfs,
-                config: config,
-                state: .registered,
-                process: nil
-            )
+            let fileMountContext = try FileMountContext.prepare(mounts: config.mounts)
+
+            switch state.phase {
+            case .initialized:
+                state.containers[id] = PodContainer(
+                    id: id,
+                    rootfs: rootfs,
+                    config: config,
+                    state: .registered,
+                    process: nil,
+                    fileMountContext: fileMountContext
+                )
+
+            case .created(let createdState):
+                let vm = createdState.vm
+
+                var modifiedRootfs = rootfs
+                modifiedRootfs.options.removeAll(where: { $0 == "ro" })
+
+                let attachment = try await vm.hotplug(modifiedRootfs, id: id)
+
+                var updatedFileMountContext = fileMountContext
+                do {
+                    let virtioFSMounts = fileMountContext.transformedMounts.filter {
+                        if case .virtiofs(_) = $0.runtimeOptions { return true }
+                        return false
+                    }
+                    if !virtioFSMounts.isEmpty {
+                        try await vm.hotplugVirtioFS(virtioFSMounts, id: id)
+                    }
+
+                    let agent = try await vm.dialAgent()
+                    do {
+                        var mount = attachment.to
+                        mount.destination = Self.guestRootfsPath(id)
+                        try await agent.mount(mount)
+
+                        try vm.registerMounts(
+                            id: id,
+                            rootfs: attachment,
+                            additionalMounts: fileMountContext.transformedMounts
+                        )
+
+                        // Mount the hotplugged container's virtiofs shares in the
+                        // guest. create() does this for boot-time containers (the
+                        // /run/virtiofs loop); the hotplug path must do the same or
+                        // the container's bind mounts from /run/virtiofs/<tag> fail
+                        // with ENOENT.
+                        let newVirtiofsTags = (vm.mounts[id] ?? [])
+                            .filter { $0.type == "virtiofs" }
+                            .map { $0.source }
+                        if !newVirtiofsTags.isEmpty {
+                            // Tags already mounted in the guest at boot or by a
+                            // prior hotplug (i.e. present on another container).
+                            let alreadyMounted = Set(
+                                vm.mounts
+                                    .filter { $0.key != id }
+                                    .values.flatMap { $0 }
+                                    .filter { $0.type == "virtiofs" }
+                                    .map { $0.source }
+                            )
+                            try await agent.mkdir(path: "/run/virtiofs", all: true, perms: 0o755)
+                            if vm.virtiofsLayout == .perTag {
+                                var seen: Set<String> = []
+                                for tag in newVirtiofsTags
+                                where !alreadyMounted.contains(tag) && seen.insert(tag).inserted {
+                                    let dest = "/run/virtiofs/\(tag)"
+                                    try await agent.mkdir(path: dest, all: true, perms: 0o755)
+                                    try await agent.mount(
+                                        ContainerizationOCI.Mount(
+                                            type: "virtiofs",
+                                            source: tag,
+                                            destination: dest,
+                                            options: []
+                                        ))
+                                }
+                            } else if alreadyMounted.isEmpty {
+                                // Unified layout: one /run/virtiofs mount, needed
+                                // only if nothing mounted it at boot / earlier.
+                                try await agent.mount(
+                                    ContainerizationOCI.Mount(
+                                        type: "virtiofs",
+                                        source: "virtiofs",
+                                        destination: "/run/virtiofs",
+                                        options: []
+                                    ))
+                            }
+                        }
+
+                        if fileMountContext.hasFileMounts {
+                            let containerMounts = vm.mounts[id] ?? []
+                            try await updatedFileMountContext.mountHoldingDirectories(
+                                vmMounts: containerMounts,
+                                agent: agent
+                            )
+                        }
+
+                        if let dns = config.dns ?? self.config.dns {
+                            try await agent.configureDNS(
+                                config: dns,
+                                location: Self.guestRootfsPath(id)
+                            )
+                        }
+
+                        if let hosts = config.hosts ?? self.config.hosts {
+                            try await agent.configureHosts(
+                                config: hosts,
+                                location: Self.guestRootfsPath(id)
+                            )
+                        }
+
+                        for socket in config.sockets {
+                            try await self.relayUnixSocket(
+                                socket: socket,
+                                containerID: id,
+                                relayManager: createdState.relayManager,
+                                agent: agent
+                            )
+                        }
+
+                        try await agent.close()
+                    } catch {
+                        try? await agent.umount(path: Self.guestRootfsPath(id), flags: 0)
+                        try? await agent.close()
+                        throw error
+                    }
+
+                    state.containers[id] = PodContainer(
+                        id: id,
+                        rootfs: rootfs,
+                        config: config,
+                        state: .created,
+                        process: nil,
+                        fileMountContext: updatedFileMountContext
+                    )
+                } catch {
+                    try? await vm.releaseHotplug(id: id)
+                    try? await vm.releaseVirtioFS(id: id)
+                    throw error
+                }
+
+            case .errored(let err):
+                throw err
+            }
         }
     }
 
@@ -293,14 +536,62 @@ extension LinuxPod {
             // Build mountsByID for all containers.
             // Strip "ro" from rootfs options - we handle readonly via the OCI spec's
             // root.readonly field and remount in vmexec after setup is complete.
+            // Use transformedMounts from fileMountContext (file mounts become directory shares).
             var mountsByID: [String: [Mount]] = [:]
             for (id, container) in state.containers {
                 var modifiedRootfs = container.rootfs
                 modifiedRootfs.options.removeAll(where: { $0 == "ro" })
-                mountsByID[id] = [modifiedRootfs] + container.config.mounts
+                // Filter out shared mounts — those are handled separately as pod volume bind mounts.
+                let containerMounts = container.fileMountContext.transformedMounts.filter {
+                    if case .shared = $0.runtimeOptions { return false }
+                    return true
+                }
+                mountsByID[id] = [modifiedRootfs] + containerMounts
             }
 
-            let vmConfig = VMConfiguration(
+            // Validate pod volume names are unique.
+            var volumeNames = Set<String>()
+            for volume in self.config.volumes {
+                guard volumeNames.insert(volume.name).inserted else {
+                    throw ContainerizationError(
+                        .invalidArgument,
+                        message: "duplicate pod volume name \"\(volume.name)\""
+                    )
+                }
+            }
+
+            // Validate that all shared mounts reference valid pod volume names.
+            for (id, container) in state.containers {
+                for mount in container.config.mounts {
+                    if case .shared = mount.runtimeOptions {
+                        guard volumeNames.contains(mount.source) else {
+                            throw ContainerizationError(
+                                .invalidArgument,
+                                message: "container \(id) references unknown pod volume \"\(mount.source)\""
+                            )
+                        }
+                    }
+                }
+            }
+            let podVolumeMounts = self.config.volumes.map { $0.toMount() }
+            if !podVolumeMounts.isEmpty {
+                mountsByID[self.id] = podVolumeMounts
+            }
+
+            // Capture into an immutable `let` so the value is safely usable
+            // from the concurrent `withAgent` closure below. The container
+            // path makes the same decision in LinuxContainer.create — CH
+            // only attaches a virtiofs device when shares are configured,
+            // so mounting an unbacked /run/virtiofs would fail with EINVAL
+            // on the CH backend.
+            let hasVirtiofsMount = mountsByID.values.contains { mounts in
+                mounts.contains { mount in
+                    if case .virtiofs = mount.runtimeOptions { return true }
+                    return false
+                }
+            }
+
+            var vmConfig = VMConfiguration(
                 cpus: self.config.cpus,
                 memoryInBytes: self.config.memoryInBytes,
                 interfaces: self.config.interfaces,
@@ -308,6 +599,7 @@ extension LinuxPod {
                 bootLog: self.config.bootLog,
                 nestedVirtualization: self.config.virtualization
             )
+            vmConfig.extensions = self.config.extensions
             let creationConfig = StandardVMConfig(configuration: vmConfig)
             let vm = try await self.vmm.create(config: creationConfig)
             let relayManager = UnixSocketRelayManager(vm: vm)
@@ -317,9 +609,46 @@ extension LinuxPod {
                 let containers = state.containers
                 let shareProcessNamespace = self.config.shareProcessNamespace
                 let pauseProcessHolder = Mutex<LinuxProcess?>(nil)
+                let fileMountContextUpdates = Mutex<[String: FileMountContext]>([:])
 
                 try await vm.withAgent { agent in
                     try await agent.standardSetup()
+
+                    // Mount the unified virtiofs share at /run/virtiofs only
+                    // when at least one container has a virtiofs mount. VZ
+                    // tolerates the unbacked mount; CH does not.
+                    if hasVirtiofsMount {
+                        try await agent.mkdir(path: "/run/virtiofs", all: true, perms: 0o755)
+                        if vm.virtiofsLayout == .perTag {
+                            // CH backend: one virtio-fs device per source-hash
+                            // tag, so mount each tag separately at
+                            // /run/virtiofs/<tag>. See LinuxContainer for the
+                            // VZ vs. CH model split.
+                            var seenTags: Set<String> = []
+                            for (_, attached) in vm.mounts {
+                                for entry in attached where entry.type == "virtiofs" {
+                                    guard seenTags.insert(entry.source).inserted else { continue }
+                                    let dest = "/run/virtiofs/\(entry.source)"
+                                    try await agent.mkdir(path: dest, all: true, perms: 0o755)
+                                    try await agent.mount(
+                                        ContainerizationOCI.Mount(
+                                            type: "virtiofs",
+                                            source: entry.source,
+                                            destination: dest,
+                                            options: []
+                                        ))
+                                }
+                            }
+                        } else {
+                            try await agent.mount(
+                                ContainerizationOCI.Mount(
+                                    type: "virtiofs",
+                                    source: "virtiofs",
+                                    destination: "/run/virtiofs",
+                                    options: []
+                                ))
+                        }
+                    }
 
                     // Create pause container if PID namespace sharing is enabled
                     if shareProcessNamespace {
@@ -383,6 +712,39 @@ extension LinuxPod {
                         try await agent.mount(rootfs)
                     }
 
+                    // Mount file mount holding directories under /run for each container.
+                    for (id, container) in containers {
+                        if container.fileMountContext.hasFileMounts {
+                            var ctx = container.fileMountContext
+                            let containerMounts = vm.mounts[id] ?? []
+                            try await ctx.mountHoldingDirectories(
+                                vmMounts: containerMounts,
+                                agent: agent
+                            )
+                            fileMountContextUpdates.withLock { $0[id] = ctx }
+                        }
+                    }
+
+                    // Mount pod-level volumes.
+                    let podVolumeAttachments = vm.mounts[self.id] ?? []
+                    for (index, volume) in self.config.volumes.enumerated() {
+                        guard index < podVolumeAttachments.count else {
+                            throw ContainerizationError(
+                                .notFound,
+                                message: "attached filesystem not found for pod volume \"\(volume.name)\""
+                            )
+                        }
+                        let attachment = podVolumeAttachments[index]
+                        let guestPath = Self.guestVolumePath(volume.name)
+                        try await agent.mount(
+                            ContainerizationOCI.Mount(
+                                type: volume.format,
+                                source: attachment.source,
+                                destination: guestPath,
+                                options: []
+                            ))
+                    }
+
                     // Start up unix socket relays for each container
                     for (_, container) in containers {
                         for socket in container.config.sockets {
@@ -398,22 +760,31 @@ extension LinuxPod {
                     // For every interface asked for:
                     // 1. Add the address requested
                     // 2. Online the adapter
-                    // 3. If a gateway IP address is present, add the default route.
+                    // 3. For the first interface, add the default route
+                    var defaultRouteSet = false
                     for (index, i) in self.interfaces.enumerated() {
                         let name = "eth\(index)"
-                        try await agent.addressAdd(name: name, ipv4Address: i.ipv4Address)
-                        try await agent.up(name: name, mtu: 1280)
-                        if let ipv4Gateway = i.ipv4Gateway {
-                            try await agent.routeAddDefault(name: name, ipv4Gateway: ipv4Gateway)
-                        }
+                        try await agent.setupInterface(
+                            i,
+                            name: name,
+                            setDefaultRoute: !defaultRouteSet,
+                            logger: self.logger
+                        )
+                        defaultRouteSet = true
                     }
 
-                    // Setup /etc/resolv.conf if asked for
-                    if let dns = self.config.dns {
-                        // Configure DNS in each container's rootfs
-                        for (_, container) in containers {
+                    // Setup /etc/resolv.conf and /etc/hosts for each container.
+                    // Container-level config takes precedence over pod-level config.
+                    for (_, container) in containers {
+                        if let dns = container.config.dns ?? self.config.dns {
                             try await agent.configureDNS(
                                 config: dns,
+                                location: Self.guestRootfsPath(container.id)
+                            )
+                        }
+                        if let hosts = container.config.hosts ?? self.config.hosts {
+                            try await agent.configureHosts(
+                                config: hosts,
                                 location: Self.guestRootfsPath(container.id)
                             )
                         }
@@ -421,6 +792,12 @@ extension LinuxPod {
                 }
 
                 state.pauseProcess = pauseProcessHolder.withLock { $0 }
+
+                // Apply file mount context updates.
+                let updates = fileMountContextUpdates.withLock { $0 }
+                for (id, ctx) in updates {
+                    state.containers[id]?.fileMountContext = ctx
+                }
 
                 // Transition all containers to created state
                 for id in state.containers.keys {
@@ -460,8 +837,66 @@ extension LinuxPod {
             do {
                 var spec = self.generateRuntimeSpec(containerID: containerID, config: container.config, rootfs: container.rootfs)
                 // We don't need the rootfs, nor do OCI runtimes want it included.
+                // Also filter out file mount holding directories - we mount those separately under /run.
+                // Transform virtiofs mounts to bind mounts from /run/virtiofs/{tag}
                 let containerMounts = createdState.vm.mounts[containerID] ?? []
-                spec.mounts = containerMounts.dropFirst().map { $0.to }
+                let holdingTags = container.fileMountContext.holdingDirectoryTags
+                var mounts: [ContainerizationOCI.Mount] =
+                    containerMounts.dropFirst()
+                    .filter { !holdingTags.contains($0.source) }
+                    .map { attached -> ContainerizationOCI.Mount in
+                        if attached.type == "virtiofs" {
+                            // Transform to bind mount from holding directory
+                            return ContainerizationOCI.Mount(
+                                type: "none",
+                                source: "/run/virtiofs/\(attached.source)",
+                                destination: attached.destination,
+                                options: ["bind"] + attached.options
+                            )
+                        }
+                        return attached.to
+                    }
+                    + container.fileMountContext.ociBindMounts()
+
+                // When useInit is enabled, bind mount vminitd from the VM's filesystem
+                // into the container so it can be executed.
+                if container.config.useInit {
+                    mounts.append(
+                        ContainerizationOCI.Mount(
+                            type: "bind",
+                            source: "/sbin/vminitd",
+                            destination: "/.cz-init",
+                            options: ["bind", "ro"]
+                        ))
+                }
+
+                // Bind mount staged sockets into the container. Sockets relayed
+                // .into the container are created in a staging directory outside
+                // the rootfs to avoid symlink traversal and mount shadowing.
+                for socket in container.config.sockets where socket.direction == .into {
+                    mounts.append(
+                        ContainerizationOCI.Mount(
+                            type: "bind",
+                            source: Self.guestSocketStagingPath(socket.id),
+                            destination: socket.destination.path,
+                            options: ["bind"]
+                        ))
+                }
+
+                // Bind mount pod volumes into the container.
+                for mount in container.config.mounts {
+                    if case .shared = mount.runtimeOptions {
+                        mounts.append(
+                            ContainerizationOCI.Mount(
+                                type: "none",
+                                source: Self.guestVolumePath(mount.source),
+                                destination: mount.destination,
+                                options: ["bind"] + mount.options
+                            ))
+                    }
+                }
+
+                spec.mounts = cleanAndSortMounts(mounts)
 
                 // Configure namespaces for the container
                 var namespaces: [LinuxNamespace] = [
@@ -536,6 +971,17 @@ extension LinuxPod {
                 return
             }
 
+            // Handle containers that were hotplugged but never started
+            if container.state == .created {
+                // Release the hotplug device and virtiofs shares
+                try? await createdState.vm.releaseHotplug(id: containerID)
+                try? await createdState.vm.releaseVirtioFS(id: containerID)
+
+                container.state = .stopped
+                state.containers[containerID] = container
+                return
+            }
+
             guard container.state == .started, let process = container.process else {
                 throw ContainerizationError(
                     .invalidState,
@@ -551,7 +997,7 @@ extension LinuxPod {
                     return
                 }
 
-                try await process.kill(SIGKILL)
+                try await process.kill(.kill)
                 try await process.wait(timeoutInSeconds: 3)
 
                 try await createdState.vm.withAgent { agent in
@@ -562,6 +1008,10 @@ extension LinuxPod {
                     )
                 }
 
+                // Release the hotplug device and virtiofs shares so they can be reused by new containers
+                try await createdState.vm.releaseHotplug(id: containerID)
+                try await createdState.vm.releaseVirtioFS(id: containerID)
+
                 // Clean up the process resources
                 try await process.delete()
 
@@ -569,6 +1019,10 @@ extension LinuxPod {
                 container.state = .stopped
                 state.containers[containerID] = container
             } catch {
+                // Try to release the hotplug device and virtiofs shares even on error
+                try? await createdState.vm.releaseHotplug(id: containerID)
+                try? await createdState.vm.releaseVirtioFS(id: containerID)
+
                 container.state = .errored
                 container.process = nil
                 state.containers[containerID] = container
@@ -601,7 +1055,7 @@ extension LinuxPod {
 
                     if let process = container.process, container.state == .started {
                         if createdState.vm.state != .stopped {
-                            try? await process.kill(SIGKILL)
+                            try? await process.kill(.kill)
                             _ = try? await process.wait(timeoutInSeconds: 3)
 
                             try? await createdState.vm.withAgent { agent in
@@ -615,7 +1069,20 @@ extension LinuxPod {
                         try? await process.delete()
                         container.process = nil
                         container.state = .stopped
+
                         state.containers[containerID] = container
+                    }
+                }
+
+                // Unmount pod-level volumes.
+                if createdState.vm.state != .stopped && !self.config.volumes.isEmpty {
+                    try? await createdState.vm.withAgent { agent in
+                        for volume in self.config.volumes {
+                            try? await agent.umount(
+                                path: Self.guestVolumePath(volume.name),
+                                flags: 0
+                            )
+                        }
                     }
                 }
 
@@ -630,7 +1097,7 @@ extension LinuxPod {
     }
 
     /// Send a signal to a container.
-    public func killContainer(_ containerID: String, signal: Int32) async throws {
+    public func killContainer(_ containerID: String, signal: Signal) async throws {
         try await self.state.withLock { state in
             guard let container = state.containers[containerID], let process = container.process else {
                 throw ContainerizationError(
@@ -694,7 +1161,14 @@ extension LinuxPod {
             }
 
             var spec = self.generateRuntimeSpec(containerID: containerID, config: container.config, rootfs: container.rootfs)
-            var config = LinuxProcessConfiguration()
+            // Inherit environment variables, working directory, user, capabilities, rlimits from container process.
+            // Reset: process arguments, terminal, stdio as these are not supposed to be inherited.
+            var config = container.config.process
+            config.arguments = []
+            config.terminal = false
+            config.stdin = nil
+            config.stdout = nil
+            config.stderr = nil
             try configuration(&config)
             spec.process = config.toOCI()
 
@@ -727,7 +1201,7 @@ extension LinuxPod {
     }
 
     /// Get statistics for containers in the pod.
-    public func statistics(containerIDs: [String]? = nil) async throws -> [ContainerStatistics] {
+    public func statistics(containerIDs: [String]? = nil, categories: StatCategory = .all) async throws -> [ContainerStatistics] {
         let (createdState, ids) = try await self.state.withLock { state in
             let createdState = try state.phase.createdState("statistics")
             let ids = containerIDs ?? Array(state.containers.keys)
@@ -735,7 +1209,7 @@ extension LinuxPod {
         }
 
         let stats = try await createdState.vm.withAgent { agent in
-            try await agent.containerStatistics(containerIDs: ids)
+            try await agent.containerStatistics(containerIDs: ids, categories: categories)
         }
 
         return stats
@@ -746,6 +1220,49 @@ extension LinuxPod {
         try await self.state.withLock { state in
             let createdState = try state.phase.createdState("dialVsock")
             return try await createdState.vm.dial(port)
+        }
+    }
+
+    /// Provides scoped access to the underlying virtual machine instance.
+    ///
+    /// Most users should prefer the higher level APIs on ``LinuxPod``
+    /// directly. This is intended for advanced use cases that need to interact
+    /// with the virtual machine outside of the pod abstraction.
+    public func withVirtualMachineInstance<T: Sendable>(
+        _ fn: @Sendable (any VirtualMachineInstance) async throws -> T
+    ) async throws -> T {
+        let vm = try await self.state.withLock { state in
+            try state.phase.createdState("withVirtualMachineInstance").vm
+        }
+        return try await fn(vm)
+    }
+
+    // Perform filesystem operations in a container.
+    public func filesystemOperation(_ containerID: String, operation: FilesystemOperation, path: String) async throws {
+        try await self.state.withLock { state in
+            let createdState = try state.phase.createdState("filesystemOperation")
+
+            guard let container = state.containers[containerID] else {
+                throw ContainerizationError(
+                    .notFound,
+                    message: "container \(containerID) not found in pod"
+                )
+            }
+
+            guard container.state == .started else {
+                throw ContainerizationError(
+                    .invalidState,
+                    message: "container \(containerID) must be started to perform filesystem operations"
+                )
+            }
+
+            try await createdState.vm.withAgent { agent in
+                guard let vminitd = agent as? Vminitd else {
+                    throw ContainerizationError(.unsupported, message: "filesystemOperation requires Vminitd agent")
+                }
+                let guestPath = URL(filePath: Self.guestRootfsPath(containerID)).appending(path: path).path
+                try await vminitd.filesystemOperation(operation: operation, path: guestPath)
+            }
         }
     }
 
@@ -806,7 +1323,7 @@ extension LinuxPod {
         let port: UInt32
         if socket.direction == .into {
             port = self.hostVsockPorts.wrappingAdd(1, ordering: .relaxed).oldValue
-            socket.destination = rootInGuest.appending(path: socket.destination.path)
+            socket.destination = URL(filePath: Self.guestSocketStagingPath(socket.id))
         } else {
             port = self.guestVsockPorts.wrappingAdd(1, ordering: .relaxed).oldValue
             socket.source = rootInGuest.appending(path: socket.source.path)
@@ -816,5 +1333,3 @@ extension LinuxPod {
         try await relayAgent.relaySocket(port: port, configuration: socket)
     }
 }
-
-#endif

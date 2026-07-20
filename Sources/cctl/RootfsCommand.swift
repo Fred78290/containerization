@@ -95,8 +95,8 @@ extension Application {
             }
 
             private func outputExt4(archive: URL, to path: URL) async throws {
-                let unpacker = EXT4Unpacker(blockSizeInBytes: 256.mib())
-                try unpacker.unpack(archive: archive, compression: .gzip, at: path)
+                let unpacker = EXT4Unpacker(capacityInBytes: 256.mib())
+                try await unpacker.unpack(archive: archive, compression: .gzip, at: path)
             }
 
             private func outputImage(path: URL, reference: String) async throws {
@@ -172,7 +172,7 @@ extension Application {
                 entry.path = "proc/self/exe"
                 entry.symlinkTarget = "sbin/vminitd"
                 entry.size = nil
-                try writer.writeEntry(entry: entry, data: data)
+                try writer.writeEntry(entry: entry, data: nil)
                 try writer.finishEncoding()
             }
         }

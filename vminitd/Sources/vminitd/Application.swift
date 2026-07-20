@@ -14,45 +14,69 @@
 // limitations under the License.
 //===----------------------------------------------------------------------===//
 
+import ArgumentParser
+import CVersion
 import ContainerizationOS
 import Foundation
 import Logging
+import VminitdCore
 
 @main
-struct Application {
+struct Application: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "vminitd",
+        abstract: "Virtual machine init daemon",
+        version: "0.1.0",
+        subcommands: [
+            AgentCommand.self,
+            InitCommand.self,
+            PauseCommand.self,
+        ],
+        defaultSubcommand: AgentCommand.self
+    )
+
     static func main() async throws {
-        LoggingSystem.bootstrap(StreamLogHandler.standardError)
+        setVersionMetadata(Self.versionMetadata())
 
-        // Parse command line arguments
-        let args = CommandLine.arguments
-        let command = args.count > 1 ? args[1] : "init"
-
-        switch command {
-        case "pause":
-            let log = Logger(label: "pause")
-
-            log.info("Running pause command")
-            try PauseCommand.run(log: log)
-        case "init":
-            fallthrough
-        default:
-            let log = Logger(label: "vminitd")
-
-            log.info("Running init command")
-            try Self.mountProc(log: log)
-            try await InitCommand.run(log: log)
-        }
-    }
-
-    // Swift seems like it has some fun issues trying to spawn threads if /proc isn't around, so we
-    // do this before calling our first async function.
-    static func mountProc(log: Logger) throws {
-        // Is it already mounted (would only be true in debug builds where we re-exec ourselves)?
-        if isProcMounted() {
+        // Busybox-style: if invoked as .cz-init, run init mode directly.
+        let invoked = CommandLine.arguments.first?.split(separator: "/").last.map(String.init) ?? ""
+        if invoked == ".cz-init" {
+            let args = Array(CommandLine.arguments.dropFirst())
+            var command = try InitCommand.parse(args)
+            try command.run()
             return
         }
 
-        log.info("mounting /proc")
+        // Swift has issues spawning threads if /proc isn't mounted,
+        // so we do this synchronously before any async code runs.
+        try mountProc()
+
+        // When running as PID 1 with a Musl-static build, Swift's runtime
+        // captures argc/argv as empty. Recover argv from /proc/self/cmdline.
+        var command = try parseAsRoot(Self.procSelfArgv())
+        if let asyncCommand = command as? AsyncParsableCommand {
+            nonisolated(unsafe) var unsafeCommand = asyncCommand
+            try await unsafeCommand.run()
+        } else {
+            try command.run()
+        }
+    }
+
+    private static func versionMetadata() -> Logger.Metadata {
+        let gitCommit = String(cString: CZ_get_git_commit())
+        let gitTag = String(cString: CZ_get_git_tag())
+        let buildTime = String(cString: CZ_get_build_time())
+        var metadata: Logger.Metadata = ["commit": "\(gitCommit)", "built": "\(buildTime)"]
+        if !gitTag.isEmpty {
+            metadata["tag"] = "\(gitTag)"
+        }
+        return metadata
+    }
+
+    private static func mountProc() throws {
+        if isProcMounted() {
+            return
+        }
 
         let mnt = ContainerizationOS.Mount(
             type: "proc",
@@ -63,7 +87,18 @@ struct Application {
         try mnt.mount(createWithPerms: 0o755)
     }
 
-    static func isProcMounted() -> Bool {
+    // /proc/self/cmdline holds argv as NUL-separated bytes. Read it after
+    // mountProc(). Returns argv minus argv[0], suitable for parseAsRoot(_:).
+    private static func procSelfArgv() -> [String] {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: "/proc/self/cmdline")) else {
+            return []
+        }
+        let parts = data.split(separator: 0, omittingEmptySubsequences: true)
+            .map { String(decoding: $0, as: UTF8.self) }
+        return Array(parts.dropFirst())
+    }
+
+    private static func isProcMounted() -> Bool {
         guard let data = try? String(contentsOfFile: "/proc/mounts", encoding: .utf8) else {
             return false
         }

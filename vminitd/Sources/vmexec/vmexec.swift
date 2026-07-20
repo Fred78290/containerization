@@ -15,18 +15,24 @@
 //===----------------------------------------------------------------------===//
 
 /// NOTE: This binary implements a very small subset of the OCI runtime spec, mostly just
-/// the process configurations. Mounts are somewhat functional, but masked and read only paths
-/// aren't checked today. Today the namespaces are also ignored, and we always spawn a new pid
-/// and mount namespace.
+/// the process configurations. Mounts, masked paths, and read-only paths are enforced.
+/// The `network` namespace is currently ignored and we always spawn a new pid and mount
+/// namespace.
 
 import ArgumentParser
 import ContainerizationError
 import ContainerizationOCI
 import ContainerizationOS
-import Foundation
+import FoundationEssentials
 import LCShim
 import Logging
+import SystemPackage
+
+#if canImport(Musl)
 import Musl
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 @main
 struct App: ParsableCommand {
@@ -68,20 +74,43 @@ extension App {
             throw App.Errno(stage: "exec", info: "process args cannot be empty")
         }
 
-        // lookup executable
-        let path = Path.findPath(currentEnv) ?? Path.getCurrentPath()
-        guard let resolvedExecutable = Path.lookPath(process.args[0], path: path) else {
-            throw App.Failure(message: "failed to find target executable \(process.args[0])")
+        let executableArg = process.args[0]
+        let resolvedExecutable: URL
+
+        if executableArg.contains("/") {
+            if executableArg.hasPrefix("/") {
+                resolvedExecutable = URL(fileURLWithPath: executableArg)
+            } else {
+                resolvedExecutable = URL(fileURLWithPath: process.cwd).appendingPathComponent(executableArg).standardized
+            }
+
+            guard FileManager.default.fileExists(atPath: resolvedExecutable.path) else {
+                throw App.Failure(message: "failed to find target executable \(executableArg)")
+            }
+        } else {
+            let path = Path.findPath(currentEnv) ?? Path.getCurrentPath()
+            guard let found = Path.lookPath(executableArg, path: path) else {
+                throw App.Failure(message: "failed to find target executable \(executableArg)")
+            }
+            resolvedExecutable = found
         }
 
-        let executable = strdup(resolvedExecutable.path())
+        let executable = strdup(resolvedExecutable.path)
         var argv = process.args.map { strdup($0) }
         argv += [nil]
-
         let env = process.env.map { strdup($0) } + [nil]
         let cwd = process.cwd
 
-        // switch cwd
+        // Create the working directory if it doesn't exist, this seems like the expected
+        // OCI runtime spec behavior.
+        if !FileManager.default.fileExists(atPath: cwd) {
+            try FileManager.default.createDirectory(
+                atPath: cwd,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o755]
+            )
+        }
+
         guard chdir(cwd) == 0 else {
             throw App.Errno(stage: "chdir(cwd)", info: "failed to change directory to '\(cwd)'")
         }
@@ -129,34 +158,45 @@ extension App {
 
     static func setRLimits(rlimits: [ContainerizationOCI.POSIXRlimit]) throws {
         for rl in rlimits {
-            var limit = rlimit(rlim_cur: rl.soft, rlim_max: rl.hard)
             let resource: Int32
             switch rl.type {
             case "RLIMIT_AS":
-                resource = RLIMIT_AS
+                resource = CZ_RLIMIT_AS
             case "RLIMIT_CORE":
-                resource = RLIMIT_CORE
+                resource = CZ_RLIMIT_CORE
             case "RLIMIT_CPU":
-                resource = RLIMIT_CPU
+                resource = CZ_RLIMIT_CPU
             case "RLIMIT_DATA":
-                resource = RLIMIT_DATA
+                resource = CZ_RLIMIT_DATA
             case "RLIMIT_FSIZE":
-                resource = RLIMIT_FSIZE
-            case "RLIMIT_NOFILE":
-                resource = RLIMIT_NOFILE
-            case "RLIMIT_STACK":
-                resource = RLIMIT_STACK
-            case "RLIMIT_NPROC":
-                resource = RLIMIT_NPROC
-            case "RLIMIT_RSS":
-                resource = RLIMIT_RSS
+                resource = CZ_RLIMIT_FSIZE
+            case "RLIMIT_LOCKS":
+                resource = CZ_RLIMIT_LOCKS
             case "RLIMIT_MEMLOCK":
-                resource = RLIMIT_MEMLOCK
+                resource = CZ_RLIMIT_MEMLOCK
+            case "RLIMIT_MSGQUEUE":
+                resource = CZ_RLIMIT_MSGQUEUE
+            case "RLIMIT_NICE":
+                resource = CZ_RLIMIT_NICE
+            case "RLIMIT_NOFILE":
+                resource = CZ_RLIMIT_NOFILE
+            case "RLIMIT_NPROC":
+                resource = CZ_RLIMIT_NPROC
+            case "RLIMIT_RSS":
+                resource = CZ_RLIMIT_RSS
+            case "RLIMIT_RTPRIO":
+                resource = CZ_RLIMIT_RTPRIO
+            case "RLIMIT_RTTIME":
+                resource = CZ_RLIMIT_RTTIME
+            case "RLIMIT_SIGPENDING":
+                resource = CZ_RLIMIT_SIGPENDING
+            case "RLIMIT_STACK":
+                resource = CZ_RLIMIT_STACK
             default:
                 errno = EINVAL
                 throw App.Errno(stage: "rlimit key unknown")
             }
-            guard setrlimit(resource, &limit) == 0 else {
+            guard CZ_setrlimit(resource, rl.soft, rl.hard) == 0 else {
                 throw App.Errno(stage: "setrlimit()")
             }
         }
@@ -166,11 +206,11 @@ extension App {
         // Create capabilities instance from OCI config
         var caps = ContainerizationOS.LinuxCapabilities()
 
-        caps.set(which: [.effective], caps: (capabilities.effective ?? []).compactMap { CapabilityName(rawValue: $0) })
-        caps.set(which: [.permitted], caps: (capabilities.permitted ?? []).compactMap { CapabilityName(rawValue: $0) })
-        caps.set(which: [.inheritable], caps: (capabilities.inheritable ?? []).compactMap { CapabilityName(rawValue: $0) })
-        caps.set(which: [.bounding], caps: (capabilities.bounding ?? []).compactMap { CapabilityName(rawValue: $0) })
-        caps.set(which: [.ambient], caps: (capabilities.ambient ?? []).compactMap { CapabilityName(rawValue: $0) })
+        caps.set(which: [.effective], caps: (capabilities.effective ?? []).compactMap { try? CapabilityName(rawValue: $0) })
+        caps.set(which: [.permitted], caps: (capabilities.permitted ?? []).compactMap { try? CapabilityName(rawValue: $0) })
+        caps.set(which: [.inheritable], caps: (capabilities.inheritable ?? []).compactMap { try? CapabilityName(rawValue: $0) })
+        caps.set(which: [.bounding], caps: (capabilities.bounding ?? []).compactMap { try? CapabilityName(rawValue: $0) })
+        caps.set(which: [.ambient], caps: (capabilities.ambient ?? []).compactMap { try? CapabilityName(rawValue: $0) })
 
         // Apply bounding set BEFORE user change (drop capabilities early)
         do {
@@ -207,6 +247,13 @@ extension App {
         try? caps.apply(kind: [.ambs])
     }
 
+    static func setNoNewPrivileges(process: ContainerizationOCI.Process) throws {
+        guard process.noNewPrivileges else { return }
+        guard CZ_prctl_set_no_new_privs() == 0 else {
+            throw App.Errno(stage: "prctl(PR_SET_NO_NEW_PRIVS)")
+        }
+    }
+
     static func Errno(stage: String, info: String = "") -> ContainerizationError {
         let posix = POSIXError(.init(rawValue: errno)!, userInfo: ["stage": stage])
         return ContainerizationError(.internalError, message: "\(info) \(String(describing: posix))")
@@ -220,7 +267,7 @@ extension App {
     }
 
     static func writeError(_ error: Error) {
-        let errorPipe = FileHandle(fileDescriptor: 5)
+        let errorPipe = FileDescriptor(rawValue: 5)
 
         let errorMessage: String
         if let czError = error as? ContainerizationError {
@@ -229,8 +276,9 @@ extension App {
             errorMessage = String(describing: error)
         }
 
-        if let data = errorMessage.data(using: .utf8) {
-            try? errorPipe.write(contentsOf: data)
+        let bytes = Array(errorMessage.utf8)
+        _ = try? bytes.withUnsafeBytes { buffer in
+            try errorPipe.write(buffer)
         }
         try? errorPipe.close()
     }

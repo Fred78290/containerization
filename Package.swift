@@ -23,7 +23,7 @@ import PackageDescription
 
 let package = Package(
     name: "containerization",
-    platforms: [.macOS("15")],
+    platforms: [.macOS("15.0")],
     products: [
         .library(name: "Containerization", targets: ["Containerization", "ContainerizationError"]),
         .library(name: "ContainerizationEXT4", targets: ["ContainerizationEXT4"]),
@@ -33,20 +33,25 @@ let package = Package(
         .library(name: "ContainerizationOS", targets: ["ContainerizationOS"]),
         .library(name: "ContainerizationExtras", targets: ["ContainerizationExtras"]),
         .library(name: "ContainerizationArchive", targets: ["ContainerizationArchive"]),
+        .library(name: "VminitdCore", targets: ["VminitdCore", "Cgroup", "LCShim"]),
+        .library(name: "CloudHypervisor", targets: ["CloudHypervisor"]),
         .executable(name: "cctl", targets: ["cctl"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-log.git", from: "1.0.0"),
-        .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0"),
+        .package(url: "https://github.com/apple/swift-log.git", from: "1.10.1"),
+        .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.7.0"),
         .package(url: "https://github.com/apple/swift-collections.git", from: "1.1.4"),
         .package(url: "https://github.com/apple/swift-crypto.git", from: "3.0.0"),
-        .package(url: "https://github.com/grpc/grpc-swift.git", from: "1.26.0"),
-        .package(url: "https://github.com/apple/swift-protobuf.git", from: "1.29.0"),
+        .package(url: "https://github.com/grpc/grpc-swift-2.git", from: "2.3.0"),
+        .package(url: "https://github.com/grpc/grpc-swift-nio-transport.git", from: "2.9.0"),
+        .package(url: "https://github.com/grpc/grpc-swift-protobuf.git", from: "2.2.0"),
+        .package(url: "https://github.com/apple/swift-protobuf.git", from: "1.36.0"),
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.80.0"),
-        .package(url: "https://github.com/swift-server/async-http-client.git", from: "1.20.1"),
-        .package(url: "https://github.com/apple/swift-system.git", from: "1.4.0"),
-        .package(url: "https://github.com/swiftlang/swift-docc-plugin", from: "1.1.0"),
         .package(url: "https://github.com/apple/swift-nio-ssl.git", from: "2.36.0"),
+        .package(url: "https://github.com/swift-server/async-http-client.git", from: "1.20.1"),
+        .package(url: "https://github.com/apple/swift-system.git", from: "1.6.4"),
+        .package(url: "https://github.com/swiftlang/swift-docc-plugin", from: "1.1.0"),
+        .package(url: "https://github.com/facebook/zstd.git", exact: "1.5.7"),
     ],
     targets: [
         .target(
@@ -56,14 +61,20 @@ let package = Package(
             name: "Containerization",
             dependencies: [
                 .product(name: "Logging", package: "swift-log"),
-                .product(name: "GRPC", package: "grpc-swift"),
                 .product(name: "SystemPackage", package: "swift-system"),
+                .product(name: "GRPCCore", package: "grpc-swift-2"),
+                .product(name: "GRPCNIOTransportHTTP2", package: "grpc-swift-nio-transport"),
+                .product(name: "GRPCProtobuf", package: "grpc-swift-protobuf"),
                 .product(name: "_NIOFileSystem", package: "swift-nio"),
+                "CloudHypervisor",
+                "ContainerizationArchive",
                 "ContainerizationOCI",
                 "ContainerizationOS",
                 "ContainerizationIO",
                 "ContainerizationExtras",
-                .target(name: "ContainerizationEXT4", condition: .when(platforms: [.macOS])),
+                "ContainerizationEXT4",
+                "ContainerizationNetlink",
+                "CShim",
             ],
             exclude: [
                 "../Containerization/SandboxContext/SandboxContext.proto"
@@ -75,21 +86,16 @@ let package = Package(
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 "Containerization",
+                "ContainerizationArchive",
+                "ContainerizationEXT4",
+                "ContainerizationExtras",
+                "ContainerizationOCI",
                 "ContainerizationOS",
             ]
         ),
-        .executableTarget(
-            name: "containerization-integration",
-            dependencies: [
-                .product(name: "Logging", package: "swift-log"),
-                .product(name: "ArgumentParser", package: "swift-argument-parser"),
-                "Containerization",
-            ],
-            path: "Sources/Integration"
-        ),
         .testTarget(
             name: "ContainerizationUnitTests",
-            dependencies: ["Containerization"],
+            dependencies: ["Containerization", "CloudHypervisor"],
             path: "Tests/ContainerizationTests",
             resources: [
                 .copy("ImageTests/Resources/scratch.tar"),
@@ -99,7 +105,7 @@ let package = Package(
         .target(
             name: "ContainerizationEXT4",
             dependencies: [
-                .target(name: "ContainerizationArchive", condition: .when(platforms: [.macOS])),
+                "ContainerizationArchive",
                 .product(name: "SystemPackage", package: "swift-system"),
                 "ContainerizationOS",
             ],
@@ -130,9 +136,10 @@ let package = Package(
         .target(
             name: "ContainerizationArchive",
             dependencies: [
-                "CArchive",
                 .product(name: "SystemPackage", package: "swift-system"),
+                "CArchive",
                 "ContainerizationExtras",
+                "ContainerizationOS",
             ],
             exclude: [
                 "CArchive"
@@ -142,17 +149,26 @@ let package = Package(
             name: "ContainerizationArchiveTests",
             dependencies: [
                 "ContainerizationArchive"
+            ],
+            resources: [
+                .copy("Resources/test.tar.zst")
             ]
         ),
         .target(
             name: "CArchive",
-            dependencies: [],
+            dependencies: [
+                .product(name: "libzstd", package: "zstd")
+            ],
             path: "Sources/ContainerizationArchive/CArchive",
+            sources: [
+                "archive_swift_bridge.c"
+            ],
             cSettings: [
                 .define(
                     "PLATFORM_CONFIG_H", to: "\"config_darwin.h\"",
                     .when(platforms: [.iOS, .macOS, .macCatalyst, .watchOS, .driverKit, .tvOS])),
                 .define("PLATFORM_CONFIG_H", to: "\"config_linux.h\"", .when(platforms: [.linux])),
+                .unsafeFlags(["-fno-modules"]),
             ],
             linkerSettings: [
                 .linkedLibrary("z"),
@@ -203,6 +219,7 @@ let package = Package(
             name: "ContainerizationOS",
             dependencies: [
                 .product(name: "Logging", package: "swift-log"),
+                .product(name: "SystemPackage", package: "swift-system"),
                 "CShim",
                 "ContainerizationError",
             ],
@@ -213,6 +230,7 @@ let package = Package(
         .testTarget(
             name: "ContainerizationOSTests",
             dependencies: [
+                .product(name: "SystemPackage", package: "swift-system"),
                 "ContainerizationOS",
                 "ContainerizationExtras",
             ]
@@ -246,5 +264,77 @@ let package = Package(
         .target(
             name: "CShim"
         ),
+        .target(
+            name: "CloudHypervisor",
+            dependencies: [
+                .product(name: "AsyncHTTPClient", package: "async-http-client"),
+                .product(name: "Logging", package: "swift-log"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+                .product(name: "NIOConcurrencyHelpers", package: "swift-nio"),
+            ],
+            exclude: [
+                "README.md"
+            ]
+        ),
+        .testTarget(
+            name: "CloudHypervisorTests",
+            dependencies: [
+                "CloudHypervisor",
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+                .product(name: "NIOConcurrencyHelpers", package: "swift-nio"),
+            ]
+        ),
+        .target(
+            name: "LCShim",
+            path: "vminitd/Sources/LCShim"
+        ),
+        .target(
+            name: "Cgroup",
+            dependencies: [
+                .product(name: "Logging", package: "swift-log"),
+                "ContainerizationOCI",
+                "ContainerizationOS",
+                .product(name: "SystemPackage", package: "swift-system"),
+                "LCShim",
+            ],
+            path: "vminitd/Sources/Cgroup"
+        ),
+        .target(
+            name: "VminitdCore",
+            dependencies: [
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+                .product(name: "Logging", package: "swift-log"),
+                "Containerization",
+                "ContainerizationArchive",
+                "ContainerizationNetlink",
+                "ContainerizationIO",
+                "ContainerizationOS",
+                .product(name: "SystemPackage", package: "swift-system"),
+                .product(name: "GRPCCore", package: "grpc-swift-2"),
+                .product(name: "GRPCNIOTransportHTTP2", package: "grpc-swift-nio-transport"),
+                .product(name: "GRPCProtobuf", package: "grpc-swift-protobuf"),
+                "LCShim",
+                "Cgroup",
+            ],
+            path: "vminitd/Sources/VminitdCore"
+        ),
     ]
+)
+
+package.targets.append(
+    .executableTarget(
+        name: "containerization-integration",
+        dependencies: [
+            .product(name: "Logging", package: "swift-log"),
+            .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            .product(name: "NIOCore", package: "swift-nio"),
+            .product(name: "NIOPosix", package: "swift-nio"),
+            "Containerization",
+        ],
+        path: "Sources/Integration"
+    )
 )

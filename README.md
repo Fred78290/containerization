@@ -1,4 +1,7 @@
-# Containerization
+<h1>
+  <img alt="Containerization logo" src="./assets/Containerization-Logo.png" width="70" valign="middle">
+  &nbsp;Containerization
+</h1>
 
 The Containerization package allows applications to use Linux containers.
 Containerization is written in [Swift](https://www.swift.org) and uses [Virtualization.framework](https://developer.apple.com/documentation/virtualization) on Apple silicon.
@@ -28,6 +31,22 @@ Containerization executes each Linux container inside of its own lightweight vir
 The API allows the runtime environment to be configured and containerized processes to be launched.
 `vminitd` provides I/O, signals, and events to the calling process when a process is run.
 
+## Backends
+
+Containerization abstracts the VMM behind the `VirtualMachineManager` /
+`VirtualMachineInstance` protocols and ships two implementations:
+
+- **macOS — Virtualization.framework** (`VZVirtualMachineManager`). The shipping path on Apple silicon. Uses Apple's `Virtualization` framework directly; no extra binaries required.
+- **Linux — cloud-hypervisor + KVM** (`CHVirtualMachineManager`). One `cloud-hypervisor` subprocess per VM, controlled over its REST-on-UDS API by the standalone [`CloudHypervisor`](./Sources/CloudHypervisor) Swift package. Block storage uses virtio-blk, shared directories use virtio-fs (one `virtiofsd` per share), networking uses TAP, and the guest agent is reached over cloud-hypervisor's hybrid vsock — same `vminitd` contract as the macOS path, so guest-side semantics are unchanged.
+
+The Linux backend requires:
+
+- `cloud-hypervisor` and `virtiofsd` on the host. Both are looked up on `PATH` by default; `CHVirtualMachineManager.init` accepts explicit URLs to override. `virtiofsd` is resolved lazily — a VM that uses only block-device mounts can run without it installed at all. Recent stable releases of each are recommended (smoke testing pins specific versions).
+- KVM access (`/dev/kvm` readable + writable by the calling user).
+- Pre-staged TAP / bridge / NAT plumbing if the container needs networking. `TAPInterface` consumes an existing TAP device by name; bringing it up, attaching it to a bridge, and configuring NAT or routing is the caller's responsibility.
+
+The integration test suite (`make linux-integration`) runs inside an apple/container Linux VM with nested virt enabled (`container run --virtualization`). The kata kernel fetched by `make fetch-default-kernel` does not enable KVM, so the integration suite uses the in-repo kernel at `kernel/vmlinux-arm64` (or `kernel/vmlinuz-x86_64` on x86_64 hosts) instead — build it with `make -C kernel` before invoking `make linux-integration`. On Linux the suite runs only the cross-platform scenarios that don't depend on macOS-only types; the full suite remains macOS-only for now.
+
 ## Requirements
 
 To build the Containerization package, you need:
@@ -40,7 +59,7 @@ Older versions of macOS are not supported.
 
 ## Example Usage
 
-For examples of how to use some of the libraries surface, the cctl executable is a good start. This app is a useful playground for exploring the API. It contains commands that exercise some of the core functionality of the various products, such as:
+For examples of how to use the libraries' API surface, the cctl executable is a good start. This app is a useful playground for exploring the API. It contains commands that exercise some of the core functionality of the various products, such as:
 
 1. [Manipulating OCI images](./Sources/cctl/ImageCommand.swift)
 2. [Logging in to container registries](./Sources/cctl/LoginCommand.swift)
@@ -54,7 +73,7 @@ Containerization provides an optimized kernel configuration located in the [kern
 
 This directory includes a containerized build environment to easily compile a kernel for use with Containerization.
 
-The kernel configuration is a minimal set of features to support fast start times and a light weight environment.
+The kernel configuration is a minimal set of features to support fast start times and a lightweight environment.
 
 While this configuration will work for the majority of workloads we understand that some will need extra features.
 To solve this Containerization provides first class APIs to use different kernel configurations and versions on a per container basis.
@@ -124,7 +143,7 @@ make test integration
 ```
 
 A kernel is required to run integration tests.
-If you do not have a kernel locally for use a default kernel can be fetched using the `make fetch-default-kernel` target.
+If you do not have a kernel locally, a default kernel can be fetched using the `make fetch-default-kernel` target.
 
 Fetching the default kernel only needs to happen after an initial build or after a `make clean`.
 
@@ -144,6 +163,10 @@ make protos
 ## Building a kernel
 
 If you'd like to build your own kernel please see the instructions in the [kernel directory](./kernel/README.md).
+
+## Pre-commit hook
+
+Run `make pre-commit` to install a pre-commit hook that ensures that your changes have correct formatting and license headers when you run `git commit`.
 
 ## Documentation
 

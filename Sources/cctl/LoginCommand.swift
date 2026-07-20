@@ -21,6 +21,7 @@ import ContainerizationExtras
 import ContainerizationOCI
 import Foundation
 
+#if os(macOS)
 extension Application {
     struct Login: AsyncParsableCommand {
 
@@ -40,8 +41,6 @@ extension Application {
         @Argument(help: "Registry server name")
         var server: String
 
-        @Flag(help: "Use plain text http to authenticate") var http: Bool = false
-
         func run() async throws {
             var username = self.username
             var password = ""
@@ -54,9 +53,9 @@ extension Application {
                 }
                 password = String(decoding: passwordData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
             }
-            let keychain = KeychainHelper(id: Application.keychainID)
+            let keychain = KeychainHelper(securityDomain: Application.keychainID)
             if username == "" {
-                username = try keychain.userPrompt(domain: server)
+                username = try keychain.userPrompt(hostname: server)
             }
             if password == "" {
                 password = try keychain.passwordPrompt()
@@ -64,10 +63,9 @@ extension Application {
             }
 
             let server = Reference.resolveDomain(domain: self.server)
-            let scheme = http ? "http" : "https"
             let client = RegistryClient(
                 host: server,
-                scheme: scheme,
+                scheme: "https",
                 authentication: BasicAuthentication(username: username, password: password),
                 retryOptions: .init(
                     maxRetries: 10,
@@ -79,8 +77,9 @@ extension Application {
                 tlsConfiguration: TLSUtils.makeEnvironmentAwareTLSConfiguration(),
             )
             try await client.ping()
-            try keychain.save(domain: server, username: username, password: password)
+            try keychain.save(hostname: server, username: username, password: password)
             print("Login succeeded")
         }
     }
 }
+#endif

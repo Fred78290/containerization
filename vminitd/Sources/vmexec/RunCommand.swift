@@ -18,10 +18,15 @@ import ArgumentParser
 import Cgroup
 import ContainerizationOCI
 import ContainerizationOS
-import Foundation
+import FoundationEssentials
 import LCShim
-import Logging
+import SystemPackage
+
+#if canImport(Musl)
 import Musl
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 struct RunCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
@@ -48,7 +53,10 @@ struct RunCommand: ParsableCommand {
         }
     }
 
-    private func childRootSetup(rootfs: ContainerizationOCI.Root, mounts: [ContainerizationOCI.Mount]) throws {
+    private func childRootSetup(
+        rootfs: ContainerizationOCI.Root,
+        mounts: [ContainerizationOCI.Mount]
+    ) throws {
         // setup rootfs
         try prepareRoot(rootfs: rootfs.path)
         try mountRootfs(rootfs: rootfs.path, mounts: mounts)
@@ -64,6 +72,71 @@ struct RunCommand: ParsableCommand {
         try reOpenDevNull()
     }
 
+    /// Mask paths per OCI `linux.maskedPaths`. Files (and any non-directory)
+    /// get `/dev/null` bind-mounted on top; directories get an empty read-only
+    /// tmpfs. Missing paths are skipped silently — matches runc's `maskPath`.
+    private func applyMaskedPaths(_ paths: [String]) throws {
+        for path in paths {
+            var st = stat()
+            if stat(path, &st) != 0 {
+                if errno == ENOENT {
+                    continue
+                }
+                throw App.Errno(stage: "stat(\(path)) for mask")
+            }
+
+            if (st.st_mode & S_IFMT) == S_IFDIR {
+                // Match runc: mask directories with a read-only tmpfs. MS_RDONLY
+                // is what actually prevents writes into the masked dir; a
+                // `size=0k` option would be a no-op (the kernel treats tmpfs
+                // size=0 as "no limit", not an empty filesystem).
+                guard mount("tmpfs", path, "tmpfs", UInt(MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC), nil) == 0 else {
+                    throw App.Errno(stage: "mount(tmpfs mask \(path))")
+                }
+            } else {
+                guard mount("/dev/null", path, "bind", UInt(MS_BIND), nil) == 0 else {
+                    throw App.Errno(stage: "mount(bind /dev/null -> \(path))")
+                }
+            }
+        }
+    }
+
+    /// Make paths read-only per OCI `linux.readonlyPaths` by bind-mounting
+    /// each onto itself and remounting with `MS_RDONLY`. Missing paths are
+    /// skipped silently — matches runc's `readonlyPath`. The statfs fallback
+    /// mirrors `remountRootfsReadOnly()` for filesystems whose existing flags
+    /// (e.g. nosuid, nodev) must be preserved on the remount.
+    private func applyReadonlyPaths(_ paths: [String]) throws {
+        for path in paths {
+            var st = stat()
+            if stat(path, &st) != 0 {
+                if errno == ENOENT {
+                    continue
+                }
+                throw App.Errno(stage: "stat(\(path)) for readonly")
+            }
+
+            guard mount(path, path, "", UInt(MS_BIND | MS_REC), nil) == 0 else {
+                throw App.Errno(stage: "mount(bind \(path))")
+            }
+
+            var flags = UInt(MS_BIND | MS_REMOUNT | MS_RDONLY)
+            if mount("", path, "", flags, "") == 0 {
+                continue
+            }
+
+            var s = statfs()
+            guard statfs(path, &s) == 0 else {
+                throw App.Errno(stage: "statfs(\(path))")
+            }
+            flags |= UInt(s.f_flags)
+
+            guard mount("", path, "", flags, "") == 0 else {
+                throw App.Errno(stage: "mount remount-ro \(path)")
+            }
+        }
+    }
+
     private func remountRootfsReadOnly() throws {
         var flags = UInt(MS_BIND | MS_REMOUNT | MS_RDONLY)
 
@@ -76,7 +149,7 @@ struct RunCommand: ParsableCommand {
         guard statfs("/", &s) == 0 else {
             throw App.Errno(stage: "statfs(/)")
         }
-        flags |= s.f_flags
+        flags |= UInt(s.f_flags)
 
         guard mount("", "/", "", flags, "") == 0 else {
             throw App.Errno(stage: "mount rootfs ro")
@@ -85,8 +158,8 @@ struct RunCommand: ParsableCommand {
 
     private func childSetup(
         spec: ContainerizationOCI.Spec,
-        ackPipe: FileHandle,
-        syncPipe: FileHandle,
+        ackPipe: FileDescriptor,
+        syncPipe: FileDescriptor
     ) throws {
         guard let process = spec.process else {
             throw App.Failure(message: "no process configuration found in runtime spec")
@@ -96,12 +169,14 @@ struct RunCommand: ParsableCommand {
         }
 
         // Wait for the grandparent to tell us that they acked our pid.
-        guard let data = try ackPipe.read(upToCount: App.ackPid.count) else {
+        var pidAckBuffer = [UInt8](repeating: 0, count: App.ackPid.count)
+        let pidAckBytesRead = try pidAckBuffer.withUnsafeMutableBytes { buffer in
+            try ackPipe.read(into: buffer)
+        }
+        guard pidAckBytesRead > 0 else {
             throw App.Failure(message: "read ack pipe")
         }
-        guard let pidAckStr = String(data: data, encoding: .utf8) else {
-            throw App.Failure(message: "convert ack pipe data to string")
-        }
+        let pidAckStr = String(decoding: pidAckBuffer[..<pidAckBytesRead], as: UTF8.self)
 
         guard pidAckStr == App.ackPid else {
             throw App.Failure(message: "received invalid acknowledgement string: \(pidAckStr)")
@@ -122,17 +197,19 @@ struct RunCommand: ParsableCommand {
             try pty.configureStdIO()
             var masterFD = pty.master
 
-            let data = Data(bytes: &masterFD, count: MemoryLayout.size(ofValue: masterFD))
-            try syncPipe.write(contentsOf: data)
+            try withUnsafeBytes(of: &masterFD) { bytes in
+                _ = try syncPipe.write(bytes)
+            }
 
             // Wait for the grandparent to tell us that they acked our console.
-            guard let data = try ackPipe.read(upToCount: App.ackConsole.count) else {
+            var consoleAckBuffer = [UInt8](repeating: 0, count: App.ackConsole.count)
+            let consoleAckBytesRead = try consoleAckBuffer.withUnsafeMutableBytes { buffer in
+                try ackPipe.read(into: buffer)
+            }
+            guard consoleAckBytesRead > 0 else {
                 throw App.Failure(message: "read ack pipe")
             }
-
-            guard let consoleAckStr = String(data: data, encoding: .utf8) else {
-                throw App.Failure(message: "convert ack pipe data to string")
-            }
+            let consoleAckStr = String(decoding: consoleAckBuffer[..<consoleAckBytesRead], as: UTF8.self)
 
             guard consoleAckStr == App.ackConsole else {
                 throw App.Failure(message: "received invalid acknowledgement string: \(consoleAckStr)")
@@ -148,12 +225,37 @@ struct RunCommand: ParsableCommand {
 
         if !spec.hostname.isEmpty {
             let errCode = spec.hostname.withCString { ptr in
-                Musl.sethostname(ptr, spec.hostname.count)
+                sethostname(ptr, spec.hostname.count)
             }
             guard errCode == 0 else {
                 throw App.Errno(stage: "sethostname()")
             }
         }
+
+        // Apply sysctls from the OCI spec.
+        if let sysctls = spec.linux?.sysctl {
+            for (key, value) in sysctls {
+                let path = "/proc/sys/" + key.replacingOccurrences(of: ".", with: "/")
+                let fd = open(path, O_WRONLY)
+                guard fd >= 0 else {
+                    throw App.Errno(stage: "sysctl open(\(path))")
+                }
+                defer { close(fd) }
+                let bytes = Array(value.utf8)
+                let written = write(fd, bytes, bytes.count)
+                guard written == bytes.count else {
+                    throw App.Errno(stage: "sysctl write(\(key)=\(value))")
+                }
+            }
+        }
+
+        // Apply OCI maskedPaths/readonlyPaths AFTER sysctls (writes to
+        // /proc/sys/* would otherwise fail once /proc/sys is remounted ro)
+        // and BEFORE the user/capability change (mount() requires
+        // CAP_SYS_ADMIN, which we still have here as root). Mask runs first
+        // so a path appearing in both lists is hidden, not just locked.
+        try self.applyMaskedPaths(spec.linux?.maskedPaths ?? [])
+        try self.applyReadonlyPaths(spec.linux?.readonlyPaths ?? [])
 
         // Apply O_CLOEXEC to all file descriptors except stdio.
         // This ensures that all unwanted fds we may have accidentally
@@ -174,6 +276,9 @@ struct RunCommand: ParsableCommand {
 
         // Finish capabilities (after user change)
         try App.finishCapabilities(preparedCaps)
+
+        // Set no_new_privs if requested by the OCI spec.
+        try App.setNoNewPrivileges(process: process)
 
         // Finally execve the container process.
         try App.exec(process: process, currentEnv: process.env)
@@ -220,8 +325,8 @@ struct RunCommand: ParsableCommand {
     }
 
     private func execInNamespace(spec: ContainerizationOCI.Spec) throws {
-        let syncPipe = FileHandle(fileDescriptor: 3)
-        let ackPipe = FileHandle(fileDescriptor: 4)
+        let syncPipe = FileDescriptor(rawValue: 3)
+        let ackPipe = FileDescriptor(rawValue: 4)
 
         let unshareFlags = try setupNamespaces(namespaces: spec.linux?.namespaces)
 
@@ -255,8 +360,9 @@ struct RunCommand: ParsableCommand {
 
             // Send our child's pid before we exit.
             var childPid = processID
-            let data = Data(bytes: &childPid, count: MemoryLayout.size(ofValue: childPid))
-            try syncPipe.write(contentsOf: data)
+            try withUnsafeBytes(of: &childPid) { bytes in
+                _ = try syncPipe.write(bytes)
+            }
         }
     }
 

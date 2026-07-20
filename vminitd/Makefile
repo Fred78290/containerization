@@ -14,37 +14,74 @@
 
 BUILD_CONFIGURATION ?= debug
 WARNINGS_AS_ERRORS ?= true
+export GIT_COMMIT := $(shell git rev-parse HEAD)
+export GIT_TAG := $(shell git describe --tags --exact-match 2>/dev/null || echo "")
+export BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 SWIFT_WARNING_CONFIG := $(if $(filter-out false,$(WARNINGS_AS_ERRORS)),-Xswiftc -warnings-as-errors)
-SWIFT_CONFIGURATION := --swift-sdk aarch64-swift-linux-musl $(SWIFT_WARNING_CONFIG) -Xlinker -s
+# MUSL_ARCH selects which Static Linux SDK triple to build against
+# ($(MUSL_ARCH)-swift-linux-musl). Defaults to the host architecture
+# so the in-tree aarch64 flow works unchanged, but callers can override
+# (e.g. `make MUSL_ARCH=x86_64` for the dist-x86_64 cross-build path).
+ifndef MUSL_ARCH
+UNAME_M := $(shell uname -m)
+ifeq ($(UNAME_M),arm64)
+MUSL_ARCH := aarch64
+else ifeq ($(UNAME_M),aarch64)
+MUSL_ARCH := aarch64
+else
+MUSL_ARCH := x86_64
+endif
+endif
 
-SWIFT_VERSION := 6.2.3
-SWIFT_SDK_URL := https://download.swift.org/swift-6.2.3-release/static-sdk/swift-6.2.3-RELEASE/swift-6.2.3-RELEASE_static-linux-0.0.1.artifactbundle.tar.gz
+LIBC ?= musl
+ifeq ($(LIBC),musl)
+SWIFT_SDK_FLAGS := --swift-sdk $(MUSL_ARCH)-swift-linux-musl
+endif
+
+SWIFT_CONFIGURATION := $(SWIFT_SDK_FLAGS) $(SWIFT_WARNING_CONFIG) -Xlinker -s --disable-automatic-resolution
+
+SWIFT_VERSION := 6.3.0
+SWIFT_SDK_URL := https://download.swift.org/swift-6.3-release/static-sdk/swift-6.3-RELEASE/swift-6.3-RELEASE_static-linux-0.1.0.artifactbundle.tar.gz
+SWIFT_SDK_CHECKSUM := d2078b69bdeb5c31202c10e9d8a11d6f66f82938b51a4b75f032ccb35c4c286c
 SWIFT_SDK_PATH := /tmp/$(notdir $(SWIFT_SDK_URL))
 
+SYSTEM_TYPE := $(shell uname -s)
+ifeq ($(SYSTEM_TYPE),Darwin)
 SWIFTLY_URL := https://download.swift.org/swiftly/darwin/swiftly.pkg
 SWIFTLY_FILENAME := $(notdir $(SWIFTLY_URL))
 SWIFTLY_BIN_DIR ?= ~/.swiftly/bin
-BUILD_BIN_DIR := $(shell swift build -c $(BUILD_CONFIGURATION) $(SWIFT_CONFIGURATION) --show-bin-path)
+SWIFT := $(SWIFTLY_BIN_DIR)/swift
+else
+SWIFT ?= swift
+endif
+BUILD_BIN_DIR := $(shell $(SWIFT) build -c $(BUILD_CONFIGURATION) $(SWIFT_CONFIGURATION) --show-bin-path)
 
+ifeq ($(SYSTEM_TYPE),Darwin)
 MACOS_VERSION := $(shell sw_vers -productVersion)
 MACOS_MAJOR := $(shell echo $(MACOS_VERSION) | cut -d. -f1)
 MACOS_RELEASE_TYPE := $(shell sw_vers | grep ReleaseType)
+endif
 
 .DEFAULT_GOAL := all
 
+# INSTALL_DIR is where built binaries land. Defaults to ./bin so the
+# in-tree aarch64 flow is unchanged. The dist-x86_64 cross-build
+# overrides this to keep its artifacts out of vminitd/bin/.
+INSTALL_DIR ?= ./bin
+
 .PHONY: all
-all: 
+all:
 	@echo Building vminitd and vmexec...
-	@mkdir -p ./bin/
-	@rm -f ./bin/vminitd
-	@rm -f ./bin/vmexec
-	@swift --version
-	@swift build -c $(BUILD_CONFIGURATION) $(SWIFT_CONFIGURATION)
-	@install "$(BUILD_BIN_DIR)/vminitd" ./bin/
-	@install "$(BUILD_BIN_DIR)/vmexec" ./bin/
+	@mkdir -p $(INSTALL_DIR)
+	@rm -f $(INSTALL_DIR)/vminitd
+	@rm -f $(INSTALL_DIR)/vmexec
+	@$(SWIFT) --version
+	@$(SWIFT) build -c $(BUILD_CONFIGURATION) $(SWIFT_CONFIGURATION)
+	@install "$(BUILD_BIN_DIR)/vminitd" $(INSTALL_DIR)/
+	@install "$(BUILD_BIN_DIR)/vmexec" $(INSTALL_DIR)/
 
 .PHONY: cross-prep
-cross-prep: linux-sdk macos-sdk
+cross-prep: swift linux-sdk
 
 .PHONY: swiftly
 swiftly:
@@ -64,33 +101,15 @@ swift: swiftly
 	@${SWIFTLY_BIN_DIR}/swiftly install $(SWIFT_VERSION)
 
 .PHONY: linux-sdk
-linux-sdk: swift
+linux-sdk:
 	@echo Installing Static Linux SDK...
 	@curl -L -o $(SWIFT_SDK_PATH) $(SWIFT_SDK_URL)
-	-@swift sdk install $(SWIFT_SDK_PATH)
+	-@$(SWIFT) sdk install $(SWIFT_SDK_PATH) --checksum $(SWIFT_SDK_CHECKSUM)
 	@rm $(SWIFT_SDK_PATH)
-
-.PHONY: macos-sdk
-macos-sdk:
-	# Consider switching back to `xcode-cltools`, when possible.
-	@if [ $(MACOS_MAJOR) -gt 15 ] && [ "$(MACOS_RELEASE_TYPE)" = "" ]; then \
-	  "$(MAKE)" xcode; \
-	else \
-	  "$(MAKE)" xcode; \
-	fi
-
-.PHONY: xcode-cltools
-xcode-cltools:
-	@echo Activating Xcode Command Line Tools...
-	@sudo xcode-select --switch /Library/Developer/CommandLineTools
-
-.PHONY: xcode
-xcode:
-	@echo "Please install the latest version of Xcode 26 and set the path for the active developer directory using \`sudo xcode-select -s <PATH_TO_XCODE>\`".
 
 .PHONY: clean
 clean:
 	@echo Cleaning the vminitd build files...
 	@rm -f ./bin/vminitd
 	@rm -f ./bin/vmexec
-	@swift package clean $(SWIFT_CONFIGURATION)
+	@rm -rf .build

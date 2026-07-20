@@ -14,6 +14,8 @@
 // limitations under the License.
 //===----------------------------------------------------------------------===//
 
+import Foundation
+
 /// The core error type for Containerization.
 ///
 /// Most API surfaces for the core container/process/agent types will
@@ -74,6 +76,16 @@ extension ContainerizationError: CustomStringConvertible {
             return "\(self.code): \"\(self.message)\""
         }
         return "\(self.code): \"\(self.message)\" (cause: \"\(cause)\")"
+    }
+}
+
+extension ContainerizationError: LocalizedError {
+    /// A localized message describing what error occurred.
+    public var errorDescription: String? {
+        guard let cause = self.cause else {
+            return message
+        }
+        return "\(message) (cause: \"\(cause)\")"
     }
 }
 
